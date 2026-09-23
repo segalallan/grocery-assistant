@@ -13,11 +13,7 @@ try:
 except ImportError:
     HAS_SORTABLES = False
 
-from database import (
-    get_connection, init_db, hash_password, verify_password,
-    seed_default_categories, get_household_categories,
-    count_receipt_scans_last_7_days, record_receipt_scan, PantryDatabase
-)
+from database import PantryDatabase
 from engine import PantryDepletionEngine
 from parser import ReceiptIngestor
 from notifications import send_daily_alert
