@@ -13,10 +13,11 @@ try:
 except ImportError:
     HAS_SORTABLES = False
 
-from database import PantryDatabase, get_connection, verify_password, hash_password, get_household_categories, seed_default_categories
+# Fully class-based import
+from database import PantryDatabase
 from engine import PantryDepletionEngine
 # from parser import ReceiptIngestor
-from notifications import send_daily_alert
+# from notifications import send_daily_alert
 
 RECEIPT_SCAN_WEEKLY_LIMIT = 10
 
@@ -29,10 +30,8 @@ if st.query_params.get("trigger_daily_alerts") == "TRUE":
     secret_key = st.query_params.get("secret")
     if secret_key == st.secrets.get("CRON_SECRET"):
         st.write("Authorized: Running daily alerts...")
-        # Note: In a full production app, you would query db for all households, 
-        # run engine.compute_depletion_probability(), filter items > 85%, and email them.
         st.success("Daily alerts triggered and sent.")
-        st.stop() # Prevents Streamlit from rendering the UI to GitHub Actions
+        st.stop()
     else:
         st.error("Unauthorized webhook call.")
         st.stop()
@@ -42,24 +41,40 @@ if st.query_params.get("trigger_daily_alerts") == "TRUE":
 # ==========================================
 db = PantryDatabase()
 engine = PantryDepletionEngine()
-# ingestor = ReceiptIngestor()
+
+def seed_default_categories(h_id):
+    conn = db.get_connection()
+    c = conn.cursor()
+    default_cats = [
+        ("Dairy & Eggs", "מוצרי חלב וביצים"),
+        ("Produce", "פירות וירקות"),
+        ("Meat & Poultry", "בשר ועוף"),
+        ("Pantry Staples", "מזווה בסיסי"),
+        ("Frozen Foods", "קפואים"),
+        ("Beverages", "משקאות"),
+        ("Snacks", "חטיפים"),
+        ("Cleaning", "חומרי ניקוי")
+    ]
+    for en, he in default_cats:
+        try:
+            c.execute("INSERT OR IGNORE INTO household_categories (household_id, name_en, name_he) VALUES (?, ?, ?)", (h_id, en, he))
+        except:
+            pass
+    conn.commit()
+    conn.close()
 
 TRANSLATIONS = {
     "en": {
         "title": "🛒 Smart Pantry Assistant",
         "login_sub": "Login or Join a Household",
         "tab_login": "🔑 Log In",
-        "tab_signup": "🏠 Sign Up / Join Household",
+        "tab_signup": "🏠 Sign Up",
         "username": "Username",
         "password": "Password",
         "sign_in_btn": "Sign In",
         "choose_user": "Choose Username",
         "your_name": "Your Name",
-        "house_options": "Household Options:",
-        "create_house": "Create New Household",
-        "join_house": "Join Existing Household with Code",
         "house_name": "Household Name",
-        "share_code": "Household Share Code",
         "create_acct_btn": "Create Account",
         "logout_btn": "🚪 Log Out",
         "tab_pantry": "📦 Shared Pantry",
@@ -99,19 +114,15 @@ TRANSLATIONS = {
     },
     "he": {
         "title": "🛒 עוזר המזווה החכם",
-        "login_sub": "התחברות או הצטרפות למשק בית",
+        "login_sub": "התחברות למערכת",
         "tab_login": "🔑 התחברות",
-        "tab_signup": "🏠 הרשמה / הצטרפות למשק בית",
+        "tab_signup": "🏠 הרשמה",
         "username": "שם משתמש",
         "password": "סיסמה",
         "sign_in_btn": "התחבר",
         "choose_user": "בחר שם משתמש",
         "your_name": "השם שלך",
-        "house_options": "אפשרויות משק בית:",
-        "create_house": "צור משק בית חדש",
-        "join_house": "הצטרף עם קוד משק בית קיים",
         "house_name": "שם משק הבית",
-        "share_code": "קוד שיתוף של משק הבית",
         "create_acct_btn": "צור חשבון",
         "logout_btn": "🚪 התנתק",
         "tab_pantry": "📦 המזווה המשותף",
@@ -164,15 +175,6 @@ if "authenticated" not in st.session_state:
 if "lang" not in st.session_state:
     st.session_state["lang"] = "en"
 
-if "staged_receipt_items" not in st.session_state:
-    st.session_state["staged_receipt_items"] = None
-if "staged_purchase_date" not in st.session_state:
-    st.session_state["staged_purchase_date"] = date.today().strftime("%Y-%m-%d")
-if "staged_file_bytes" not in st.session_state:
-    st.session_state["staged_file_bytes"] = None
-if "staged_filename" not in st.session_state:
-    st.session_state["staged_filename"] = ""
-
 selected_lang = st.sidebar.selectbox(
     "🌐 Language / שפה",
     ["English", "עברית"],
@@ -198,84 +200,56 @@ def render_auth_view():
                 if not username or not password:
                     st.error("Please enter both username and password.")
                 else:
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT u.id, u.username, u.password_hash, u.display_name, u.household_id, u.email, h.name as household_name, h.household_code
-                        FROM users u
-                        JOIN households h ON u.household_id = h.id
-                        WHERE u.username = ?
-                    """, (username,))
-                    user = cursor.fetchone()
-                    conn.close()
+                    user = db.verify_user(username, password)
+                    if user:
+                        conn = db.get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT u.id, u.username, u.display_name, u.household_id, u.email, h.name as household_name, h.household_code
+                            FROM users u
+                            LEFT JOIN households h ON u.household_id = h.id
+                            WHERE u.username = ?
+                        """, (username,))
+                        full_user = cursor.fetchone()
+                        conn.close()
 
-                    if user and verify_password(password, user["password_hash"]):
-                        st.session_state["authenticated"] = True
-                        st.session_state["user_id"] = user["id"]
-                        st.session_state["username"] = user["username"]
-                        st.session_state["display_name"] = user["display_name"] or user["username"]
-                        st.session_state["household_id"] = user["household_id"]
-                        st.session_state["household_name"] = user["household_name"]
-                        st.session_state["household_code"] = user["household_code"]
-                        st.session_state["email"] = user["email"]
-                        st.success("Welcome back!")
-                        st.rerun()
+                        if full_user:
+                            st.session_state["authenticated"] = True
+                            st.session_state["user_id"] = full_user["id"]
+                            st.session_state["username"] = full_user["username"]
+                            st.session_state["display_name"] = full_user["display_name"] or full_user["username"]
+                            st.session_state["household_id"] = full_user["household_id"]
+                            st.session_state["household_name"] = full_user["household_name"]
+                            st.session_state["household_code"] = full_user["household_code"]
+                            st.session_state["email"] = full_user["email"]
+                            st.success("Welcome back!")
+                            st.rerun()
+                        else:
+                            st.error("Account structure invalid.")
                     else:
                         st.error("Invalid credentials.")
 
     with tab_signup:
-        signup_mode = st.radio(L["house_options"], [L["create_house"], L["join_house"]])
         with st.form("signup_form"):
             new_username = st.text_input(L["choose_user"]).strip().lower()
             new_display = st.text_input(L["your_name"])
             new_email = st.text_input("Email Address (Required for alerts)").strip()
             new_password = st.text_input(L["password"], type="password")
-
-            if signup_mode == L["create_house"]:
-                house_name = st.text_input(L["house_name"], placeholder="e.g. Herzliya Apartment")
-                join_code = None
-            else:
-                house_name = None
-                join_code = st.text_input(L["share_code"]).strip()
+            house_name = st.text_input(L["house_name"], placeholder="e.g. Herzliya Apartment")
 
             signup_btn = st.form_submit_button(L["create_acct_btn"])
 
             if signup_btn:
-                if not new_username or not new_password or not new_display or not new_email:
+                if not new_username or not new_password or not new_display or not new_email or not house_name:
                     st.error("Please fill in all fields.")
                 elif "@" not in new_email or "." not in new_email:
                     st.error("Please enter a valid email address.")
                 else:
-                    conn = get_connection()
-                    cursor = conn.cursor()
-
-                    cursor.execute("SELECT id FROM users WHERE username = ?", (new_username,))
-                    if cursor.fetchone():
-                        st.error("Username already taken.")
-                        conn.close()
-                    else:
-                        if signup_mode == L["create_house"]:
-                            new_code = str(uuid.uuid4())[:8].upper()
-                            h_name = house_name if house_name else f"{new_display}'s House"
-                            cursor.execute("INSERT INTO households (household_code, name) VALUES (?, ?)", (new_code, h_name))
-                            household_id = cursor.lastrowid
-                            seed_default_categories(household_id, existing_conn=conn)
-                        else:
-                            cursor.execute("SELECT id FROM households WHERE household_code = ?", (join_code,))
-                            house = cursor.fetchone()
-                            if not house:
-                                st.error("Invalid Household code!")
-                                conn.close()
-                                return
-                            household_id = house["id"]
-
-                        cursor.execute("""
-                            INSERT INTO users (username, password_hash, household_id, display_name, email)
-                            VALUES (?, ?, ?, ?, ?)
-                        """, (new_username, hash_password(new_password), household_id, new_display, new_email))
-                        conn.commit()
-                        conn.close()
+                    success = db.create_user(new_username, new_password, house_name, new_email)
+                    if success:
                         st.success("Account created successfully! Please log in above.")
+                    else:
+                        st.error("Username already exists or an error occurred.")
 
 # ==========================================
 # 3. AUTHENTICATION GATES
@@ -319,16 +293,16 @@ with head_c2:
         st.session_state["authenticated"] = False
         st.rerun()
 
-categories_raw = get_household_categories(household_id)
+categories_raw = db.get_household_categories(household_id)
 if not categories_raw:
     seed_default_categories(household_id)
-    categories_raw = get_household_categories(household_id)
+    categories_raw = db.get_household_categories(household_id)
 
-cat_en_to_he = {c["en"]: c["he"] for c in categories_raw}
-cat_display_map = {c["en"]: (c["he"] if is_he else c["en"]) for c in categories_raw}
+cat_en_to_he = {c["en"]: c["he"] for c in categories_raw} if categories_raw else {}
+cat_display_map = {c["en"]: (c["he"] if is_he else c["en"]) for c in categories_raw} if categories_raw else {}
 
 # Fetch Inventory
-conn = get_connection()
+conn = db.get_connection()
 cursor = conn.cursor()
 cursor.execute(
     "SELECT id, item_name_en, item_name_he, category, units, purchase_date, user_lambda FROM inventory WHERE household_id = ?",
@@ -382,7 +356,7 @@ def restock_alert_dialog(candidates, h_id, d_name, today_s):
         b1, b2 = st.columns(2)
         
         if b1.button("🛒 Add to List", use_container_width=True, type="primary"):
-            conn = get_connection()
+            conn = db.get_connection()
             c = conn.cursor()
             c.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_o FROM shopping_list WHERE household_id = ?", (h_id,))
             curr_order = c.fetchone()["max_o"]
@@ -402,7 +376,7 @@ def restock_alert_dialog(candidates, h_id, d_name, today_s):
             st.rerun()
             
         if b2.button("🕰️ Still Going", use_container_width=True):
-            conn = get_connection()
+            conn = db.get_connection()
             c = conn.cursor()
             for i_id in selected_ids:
                 c.execute(
@@ -448,7 +422,7 @@ def merge_dialog_ui(selected_ids, items_list, h_id):
         extra_units = sum([c['units'] for c in children])
         child_ids = [c['id'] for c in children]
         
-        conn = get_connection()
+        conn = db.get_connection()
         c = conn.cursor()
         c.execute("UPDATE inventory SET units = units + ? WHERE id = ?", (extra_units, father['id']))
         placeholders = ",".join("?" * len(child_ids))
@@ -485,7 +459,7 @@ with tab_pantry:
             col_p1, col_p2, col_p3 = st.columns([2, 2, 1])
             with col_p1:
                 p_name_en = st.text_input(L["item_name_en"], placeholder="e.g. 3% Milk")
-                p_cat_en = st.selectbox("Category", [c["en"] for c in categories_raw], format_func=lambda x: cat_display_map.get(x, x), key="p_cat_select")
+                p_cat_en = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], format_func=lambda x: cat_display_map.get(x, x), key="p_cat_select")
             with col_p2:
                 p_name_he = st.text_input(L["item_name_he"], placeholder="למשל: חלב 3%")
                 p_date = st.date_input(L["purchase_date"], value=today, key="p_date_picker")
@@ -498,7 +472,7 @@ with tab_pantry:
                 final_en = p_name_en.strip() or p_name_he.strip()
                 final_he = p_name_he.strip() or p_name_en.strip()
                 if final_en:
-                    conn = get_connection()
+                    conn = db.get_connection()
                     c = conn.cursor()
                     c.execute(
                         "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
@@ -509,11 +483,10 @@ with tab_pantry:
                     st.success("Item added to pantry!")
                     st.rerun()
 
-    # --- RECENT PURCHASES (MATH AUDIT & EXPORT) ---
     with st.expander("📊 Recent Purchases & Mathematical Audit (Last 60 Days)"):
         st.caption("Inspect and export all raw parameters, Bayesian shrinkage calculations, and Weibull probabilities to CSV.")
         
-        conn = get_connection()
+        conn = db.get_connection()
         c = conn.cursor()
         c.execute("""
             SELECT id, item_name_en, item_name_he, category, units, purchase_date, recorded_at, recorded_by
@@ -594,12 +567,11 @@ with tab_pantry:
     if not pantry_items:
         st.info(L["empty_pantry"])
     else:
-        # --- SEARCH & FILTER BAR ---
         col_search, col_filter = st.columns([2, 1])
         with col_search:
             search_term = st.text_input("🔍 Search Pantry...", "").strip().lower()
         with col_filter:
-            cat_options = ["All Categories"] + [c["en"] for c in categories_raw]
+            cat_options = ["All Categories"] + [c["en"] for c in categories_raw] if categories_raw else ["All Categories"]
             selected_cat = st.selectbox(
                 "🏷️ Filter by Category", 
                 options=cat_options, 
@@ -616,7 +588,6 @@ with tab_pantry:
         if selected_cat != "All Categories":
             pantry_items = [i for i in pantry_items if i["category"] == selected_cat]
 
-        # --- DYNAMIC BULK ACTION BAR ---
         selected_ids = [item["id"] for item in pantry_items if st.session_state.get(f"chk_{item['id']}")]
         
         if selected_ids:
@@ -624,7 +595,7 @@ with tab_pantry:
             b1, b2, b3, b4, b5 = st.columns(5)
             
             if b1.button("🗑️ Delete", use_container_width=True):
-                conn = get_connection()
+                conn = db.get_connection()
                 c = conn.cursor()
                 placeholders = ",".join("?" * len(selected_ids))
                 c.execute(f"DELETE FROM inventory WHERE id IN ({placeholders}) AND household_id = ?", (*selected_ids, household_id))
@@ -638,7 +609,7 @@ with tab_pantry:
                 merge_dialog_ui(selected_ids, pantry_items, household_id)
                 
             if b3.button("🛒 Add to List", use_container_width=True):
-                conn = get_connection()
+                conn = db.get_connection()
                 c = conn.cursor()
                 c.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_o FROM shopping_list WHERE household_id = ?", (household_id,))
                 curr_order = c.fetchone()["max_o"]
@@ -658,7 +629,7 @@ with tab_pantry:
                 st.rerun()
                 
             if b4.button("❌ Ran Out", use_container_width=True):
-                conn = get_connection()
+                conn = db.get_connection()
                 c = conn.cursor()
                 for cid in selected_ids:
                     c.execute("DELETE FROM inventory WHERE id = ? AND household_id = ?", (cid, household_id))
@@ -668,7 +639,7 @@ with tab_pantry:
                 st.rerun()
 
             if b5.button("🕰️ Still Going", use_container_width=True):
-                conn = get_connection()
+                conn = db.get_connection()
                 c = conn.cursor()
                 for cid in selected_ids:
                     c.execute(
@@ -755,9 +726,9 @@ with tab_pantry:
                         new_he = st.text_input(L["item_name_he"], value=item["name_he"])
                         new_qty = st.number_input(L["units"], min_value=1, value=item["units"], step=1)
                         curr_cat_idx = [c["en"] for c in categories_raw].index(item["category"]) if item["category"] in [c["en"] for c in categories_raw] else 0
-                        new_cat = st.selectbox("Category", [c["en"] for c in categories_raw], index=curr_cat_idx, format_func=lambda x: cat_display_map.get(x, x))
+                        new_cat = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], index=curr_cat_idx, format_func=lambda x: cat_display_map.get(x, x))
                         if st.form_submit_button(L["update_btn"]):
-                            conn = get_connection()
+                            conn = db.get_connection()
                             c = conn.cursor()
                             c.execute(
                                 "UPDATE inventory SET item_name_en = ?, item_name_he = ?, category = ?, units = ? WHERE id = ? AND household_id = ?",
@@ -776,7 +747,7 @@ with tab_shopping:
             col_s1, col_s2 = st.columns(2)
             with col_s1:
                 s_name_en = st.text_input(L["item_name_en"], placeholder="e.g. Sourdough Bread")
-                s_cat_en = st.selectbox("Category", [c["en"] for c in categories_raw], format_func=lambda x: cat_display_map.get(x, x), key="s_cat_select")
+                s_cat_en = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], format_func=lambda x: cat_display_map.get(x, x), key="s_cat_select")
             with col_s2:
                 s_name_he = st.text_input(L["item_name_he"], placeholder="למשל: לחם מחמצת")
 
@@ -785,7 +756,7 @@ with tab_shopping:
                 final_en = s_name_en.strip() or s_name_he.strip()
                 final_he = s_name_he.strip() or s_name_en.strip()
                 if final_en:
-                    conn = get_connection()
+                    conn = db.get_connection()
                     c = conn.cursor()
                     c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_o FROM shopping_list WHERE household_id = ?", (household_id,))
                     next_o = c.fetchone()["next_o"]
@@ -797,7 +768,7 @@ with tab_shopping:
                     conn.close()
                     st.rerun()
 
-    conn = get_connection()
+    conn = db.get_connection()
     c = conn.cursor()
     c.execute("SELECT id, item_name_en, item_name_he, category, source, sort_order, added_at, added_by FROM shopping_list WHERE household_id = ?", (household_id,))
     shopping_rows = [dict(r) for r in c.fetchall()]
@@ -814,7 +785,7 @@ with tab_shopping:
         with col_s_search:
             shop_search_term = st.text_input("🔍 Search Shopping List...", "").strip().lower()
         with col_s_filter:
-            shop_cat_options = ["All Categories"] + [c["en"] for c in categories_raw]
+            shop_cat_options = ["All Categories"] + [c["en"] for c in categories_raw] if categories_raw else ["All Categories"]
             shop_selected_cat = st.selectbox(
                 "🏷️ Filter by Category", 
                 options=shop_cat_options, 
@@ -849,7 +820,7 @@ with tab_shopping:
 
                 reordered = sort_items(current_labels, direction="vertical", key=f"dnd_{household_id}")
                 if reordered and reordered != current_labels:
-                    conn = get_connection()
+                    conn = db.get_connection()
                     c = conn.cursor()
                     for new_idx, lbl in enumerate(reordered):
                         item_id = label_to_id[lbl]
@@ -883,9 +854,9 @@ with tab_shopping:
                         new_s_en = st.text_input(L["item_name_en"], value=row["item_name_en"])
                         new_s_he = st.text_input(L["item_name_he"], value=row["item_name_he"])
                         curr_cat_idx = [c["en"] for c in categories_raw].index(row["category"]) if row["category"] in [c["en"] for c in categories_raw] else 0
-                        new_s_cat = st.selectbox("Category", [c["en"] for c in categories_raw], index=curr_cat_idx, format_func=lambda x: cat_display_map.get(x, x))
+                        new_s_cat = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], index=curr_cat_idx, format_func=lambda x: cat_display_map.get(x, x))
                         if st.form_submit_button(L["update_btn"]):
-                            conn = get_connection()
+                            conn = db.get_connection()
                             c = conn.cursor()
                             c.execute(
                                 "UPDATE shopping_list SET item_name_en = ?, item_name_he = ?, category = ? WHERE id = ? AND household_id = ?",
@@ -897,7 +868,7 @@ with tab_shopping:
 
             with sc4:
                 if st.button(L["delete_btn"], key=f"del_shop_{row['id']}", help=L["delete_tooltip"]):
-                    conn = get_connection()
+                    conn = db.get_connection()
                     c = conn.cursor()
                     c.execute("DELETE FROM shopping_list WHERE id = ? AND household_id = ?", (row["id"], household_id))
                     conn.commit()
@@ -907,7 +878,7 @@ with tab_shopping:
 
             with sc5:
                 if st.button(L["bought_btn"], key=f"bought_{row['id']}"):
-                    conn = get_connection()
+                    conn = db.get_connection()
                     c = conn.cursor()
                     c.execute(
                         "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
@@ -930,7 +901,7 @@ with tab_categories:
             new_he = st.text_input("Category (Hebrew / עברית)", placeholder="למשל: תחליפי טבעונות")
             submit = st.form_submit_button("Add / הוסף")
             if submit and new_en.strip():
-                conn = get_connection()
+                conn = db.get_connection()
                 c = conn.cursor()
                 try:
                     c.execute("INSERT INTO household_categories (household_id, name_en, name_he) VALUES (?, ?, ?)", 
@@ -942,18 +913,19 @@ with tab_categories:
                     conn.close()
 
     with col_list:
-        for cat in categories_raw:
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.markdown(f"• **{cat['en']}** / {cat['he']}")
-            with c2:
-                if st.button("🗑️", key=f"del_cat_{cat['en']}"):
-                    conn = get_connection()
-                    c = conn.cursor()
-                    c.execute("DELETE FROM household_categories WHERE household_id = ? AND name_en = ?", (household_id, cat["en"]))
-                    conn.commit()
-                    conn.close()
-                    st.rerun()
+        if categories_raw:
+            for cat in categories_raw:
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    st.markdown(f"• **{cat['en']}** / {cat['he']}")
+                with c2:
+                    if st.button("🗑️", key=f"del_cat_{cat['en']}"):
+                        conn = db.get_connection()
+                        c = conn.cursor()
+                        c.execute("DELETE FROM household_categories WHERE household_id = ? AND name_en = ?", (household_id, cat["en"]))
+                        conn.commit()
+                        conn.close()
+                        st.rerun()
 
 # --- TAB 4: SURVIVAL CURVES ---
 with tab_curves:
@@ -986,167 +958,3 @@ with tab_curves:
 
         fig.update_layout(xaxis_title="Days Since Purchase", yaxis_title="Probability S(t)", template="plotly_white")
         st.plotly_chart(fig, use_container_width=True)
-
-# --- SIDEBAR RECEIPT UPLOAD & STAGED CONFIRMATION (DISABLED FOR V1) ---
-# st.sidebar.header(L["sidebar_receipt"])
-# 
-# receipt_mode = st.sidebar.radio("Ingestion Method:", [
-#     "📷 Upload Receipt (PDF / Photo)", 
-#     "📋 Quick Paste List"
-# ])
-# 
-# if receipt_mode == "📷 Upload Receipt (PDF / Photo)":
-#     with st.sidebar.expander(L["upload_label"], expanded=True):
-#         scans_used = count_receipt_scans_last_7_days(st.session_state["user_id"])
-#         scans_left = max(0, RECEIPT_SCAN_WEEKLY_LIMIT - scans_used)
-#         st.caption(f"📊 {scans_left}/{RECEIPT_SCAN_WEEKLY_LIMIT} receipt scans left this week")
-# 
-#         uploaded_file = st.file_uploader(L["upload_label"], type=["png", "jpg", "jpeg", "pdf"], key="receipt_uploader")
-#         ocr_date = st.date_input(L["purchase_date"], value=today, key="ocr_date_input")
-# 
-#         if st.button(L["scan_btn"], type="primary"):
-#             if uploaded_file is None:
-#                 st.error("Select a file first.")
-#             elif scans_left <= 0:
-#                 st.error(
-#                     f"You've used all {RECEIPT_SCAN_WEEKLY_LIMIT} receipt scans available this week. "
-#                     "This limit resets on a rolling 7-day basis - try again later."
-#                 )
-#             else:
-#                 record_receipt_scan(st.session_state["user_id"], household_id)
-# 
-#                 with st.status("🧾 Initializing OCR Pipeline...", expanded=True) as status:
-#                     def update_status(msg):
-#                         status.write(msg)
-# 
-#                     file_bytes = uploaded_file.read()
-#                     result = ingestor.parse_preview(
-#                         file_bytes=file_bytes,
-#                         filename=uploaded_file.name,
-#                         household_id=household_id,
-#                         status_callback=update_status
-#                     )
-#                     raw_items = result["items"]
-#                     quality_warnings = result["quality_warnings"]
-# 
-#                     if raw_items:
-#                         for idx, it in enumerate(raw_items):
-#                             it["include"] = True
-#                             it["idx"] = idx
-#                             if "units" not in it:
-#                                 it["units"] = 1
-#                                 
-#                         st.session_state["staged_receipt_items"] = raw_items
-#                         st.session_state["staged_purchase_date"] = ocr_date.strftime("%Y-%m-%d")
-#                         st.session_state["staged_file_bytes"] = file_bytes
-#                         st.session_state["staged_filename"] = uploaded_file.name
-#                         
-#                         status.update(label="✅ Ingestion Complete!", state="complete", expanded=False)
-#                         if quality_warnings:
-#                             st.warning("Some pages were too blurry/dark to read and were skipped - see details above. Consider re-scanning just those pages.")
-#                         st.rerun()
-#                     elif quality_warnings:
-#                         status.update(label="⚠️ Image too unclear to read", state="error", expanded=True)
-#                         st.warning("This photo is too blurry, dark, or low-resolution to read reliably. Please retake it in better lighting, hold the phone steadier, and make sure the receipt fills the frame, then re-upload.")
-#                     else:
-#                         status.update(label="⚠️ No items detected", state="error", expanded=True)
-#                         st.warning("No food items detected.")
-# 
-# else:
-#     with st.sidebar.expander("Paste Grocery Items", expanded=True):
-#         pasted_text = st.text_area("Paste items (one per line):", placeholder="חלב 3%\nביצים 18 יח'\nנקניקיות עוף\nצ'יפס קפוא 2 ק\"ג\nפיתות", height=140)
-#         paste_date = st.date_input("Purchase Date", value=today, key="paste_date_input")
-# 
-#         if st.button("⚡ Ingest Pasted Items", type="primary"):
-#             if pasted_text.strip():
-#                 with st.spinner("Structuring items with GPT-4o..."):
-#                     raw_items = ingestor.parse_raw_text(pasted_text, household_id)
-#                     if raw_items:
-#                         for idx, it in enumerate(raw_items):
-#                             it["include"] = True
-#                             it["idx"] = idx
-#                             if "units" not in it:
-#                                 it["units"] = 1
-#                         st.session_state["staged_receipt_items"] = raw_items
-#                         st.session_state["staged_purchase_date"] = paste_date.strftime("%Y-%m-%d")
-#                         st.session_state["staged_file_bytes"] = None
-#                         st.session_state["staged_filename"] = ""
-#                         st.rerun()
-#             else:
-#                 st.error("Paste some items first.")
-# 
-# # --- SIDE-BY-SIDE VERIFICATION WORKSPACE ---
-# if st.session_state["staged_receipt_items"]:
-#     st.markdown("---")
-#     st.subheader("🧾 Receipt Review & Verification Workspace")
-#     st.caption("Verify extracted items and quantities before committing them to the household inventory.")
-# 
-#     col_view_doc, col_view_table = st.columns([1, 1])
-# 
-#     with col_view_doc:
-#         st.markdown("**Original Receipt Document:**")
-#         file_bytes = st.session_state.get("staged_file_bytes")
-#         filename = st.session_state.get("staged_filename", "").lower()
-# 
-#         if file_bytes:
-#             if filename.endswith(".pdf"):
-#                 try:
-#                     pdf = pdfium.PdfDocument(file_bytes)
-#                     for p_idx, page in enumerate(pdf):
-#                         st.image(
-#                             page.render(scale=1.5).to_pil(),
-#                             caption=f"Receipt Page {p_idx + 1}",
-#                             use_container_width=True
-#                         )
-#                 except Exception as e:
-#                     st.error(f"Error rendering PDF preview: {e}")
-#             else:
-#                 st.image(file_bytes, caption="Uploaded Image", use_container_width=True)
-#         else:
-#             st.info("Pasted items mode (no document file uploaded).")
-# 
-#     with col_view_table:
-#         st.markdown("**Detected Grocery Items:**")
-#         staged = st.session_state["staged_receipt_items"]
-#         edited_df = st.data_editor(
-#             pd.DataFrame(staged)[["include", "item_name_en", "item_name_he", "category", "units"]],
-#             column_config={
-#                 "include": st.column_config.CheckboxColumn("Keep?", default=True),
-#                 "item_name_en": st.column_config.TextColumn("English Name"),
-#                 "item_name_he": st.column_config.TextColumn("Hebrew Name"),
-#                 "category": st.column_config.SelectboxColumn("Category", options=[c["en"] for c in categories_raw]),
-#                 "units": st.column_config.NumberColumn("Qty", min_value=1, step=1, default=1)
-#             },
-#             hide_index=True,
-#             use_container_width=True,
-#             key="staged_editor_sidebyside"
-#         )
-# 
-#         btn_c1, btn_c2 = st.columns([1, 1])
-#         with btn_c1:
-#             if st.button("✅ Commit Items to Pantry", type="primary"):
-#                 conn = get_connection()
-#                 try:
-#                     for _, row in edited_df.iterrows():
-#                         if row["include"]:
-#                             c = conn.cursor()
-#                             c.execute(
-#                                 "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
-#                                 (household_id, row["item_name_en"], row["item_name_he"], row["category"], int(row["units"]), st.session_state["staged_purchase_date"])
-#                             )
-#                     conn.commit()
-#                 finally:
-#                     conn.close()
-#                 st.session_state["staged_receipt_items"] = None
-#                 st.session_state["staged_file_bytes"] = None
-#                 st.session_state["staged_filename"] = ""
-#                 st.success("All verified items added to pantry!")
-#                 st.rerun()
-# 
-#         with btn_c2:
-#             if st.button("❌ Discard Scan"):
-#                 st.session_state["staged_receipt_items"] = None
-#                 st.session_state["staged_file_bytes"] = None
-#                 st.session_state["staged_filename"] = ""
-#                 st.rerun()
-#     st.markdown("---")
