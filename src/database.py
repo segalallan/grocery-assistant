@@ -2,22 +2,29 @@ import sqlite3
 import os
 import secrets
 import hashlib
+import uuid
 
 class PantryDatabase:
     def __init__(self, db_path="pantry.db"):
         self.db_path = db_path
         self.init_db()
 
+    def get_connection(self):
+        """Provides a raw connection configured for dictionary-like row access."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
     def init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            # Enable WAL mode for high concurrency
+        with self.get_connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             
-            # 1. Base Tables
+            # Base Tables aligned with app.py UI
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS households (
-                    household_id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    household_code TEXT UNIQUE,
                     name TEXT NOT NULL
                 )
             """)
@@ -27,91 +34,116 @@ class PantryDatabase:
                     username TEXT UNIQUE NOT NULL,
                     password_hash BYTES NOT NULL,
                     salt BYTES NOT NULL,
-                    household_id TEXT,
+                    household_id INTEGER,
                     email TEXT,
-                    FOREIGN KEY (household_id) REFERENCES households (household_id)
+                    display_name TEXT,
+                    FOREIGN KEY (household_id) REFERENCES households (id)
                 )
             """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS inventory (
-                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    household_id TEXT,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    household_id INTEGER,
                     category TEXT,
-                    item_name TEXT,
-                    quantity INTEGER,
+                    item_name_en TEXT,
+                    item_name_he TEXT,
+                    units INTEGER,
                     purchase_date DATE,
                     user_lambda REAL,
-                    FOREIGN KEY (household_id) REFERENCES households (household_id)
+                    FOREIGN KEY (household_id) REFERENCES households (id)
                 )
             """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS purchase_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    household_id TEXT,
+                    household_id INTEGER,
                     category TEXT,
                     interval_days REAL,
-                    FOREIGN KEY (household_id) REFERENCES households (household_id)
+                    FOREIGN KEY (household_id) REFERENCES households (id)
                 )
             """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS purchases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    household_id TEXT,
+                    household_id INTEGER,
                     category TEXT,
-                    item_name TEXT,
-                    quantity INTEGER,
+                    item_name_en TEXT,
+                    item_name_he TEXT,
+                    units INTEGER,
                     purchase_date DATE,
                     recorded_by TEXT,
-                    FOREIGN KEY (household_id) REFERENCES households (household_id)
+                    recorded_at TEXT,
+                    FOREIGN KEY (household_id) REFERENCES households (id)
                 )
             """)
-            
-            # 2. THE MIGRATION: Check if 'email' column exists in 'users', add it if missing
-            cursor.execute("PRAGMA table_info(users)")
-            columns = [col[1] for col in cursor.fetchall()]
-            if 'email' not in columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
-
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS shopping_list (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    household_id INTEGER,
+                    item_name_en TEXT,
+                    item_name_he TEXT,
+                    category TEXT,
+                    source TEXT,
+                    sort_order INTEGER,
+                    added_at DATE,
+                    added_by TEXT,
+                    FOREIGN KEY (household_id) REFERENCES households (id)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS household_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    household_id INTEGER,
+                    name_en TEXT,
+                    name_he TEXT,
+                    FOREIGN KEY (household_id) REFERENCES households (id)
+                )
+            """)
             conn.commit()
 
-    def create_user(self, username, password, household_name, email):
+    def create_user(self, email, password, household_name, ignored_email=None):
         """Creates a new user, hashes password, generates household, and saves email."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Generate salt and hash password
             salt = os.urandom(16)
             pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 260000)
             
-            # Create household
-            hh_id = secrets.token_hex(4)
-            cursor.execute("INSERT INTO households (household_id, name) VALUES (?, ?)", (hh_id, household_name))
+            hh_code = str(uuid.uuid4())[:8].upper()
+            cursor.execute("INSERT INTO households (household_code, name) VALUES (?, ?)", (hh_code, household_name))
+            hh_id = cursor.lastrowid
             
-            # Insert user with email
+            display_name = email.split("@")[0].capitalize()
+            
             try:
                 cursor.execute("""
-                    INSERT INTO users (username, password_hash, salt, household_id, email) 
-                    VALUES (?, ?, ?, ?, ?)
-                """, (username, pwd_hash, salt, hh_id, email))
+                    INSERT INTO users (username, password_hash, salt, household_id, email, display_name) 
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (email, pwd_hash, salt, hh_id, email, display_name))
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
-                return False # Username already exists
+                return False 
 
     def verify_user(self, username, password):
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id, password_hash, salt, household_id, email FROM users WHERE username = ?", (username,))
+            cursor.execute("SELECT id, password_hash, salt FROM users WHERE username = ?", (username,))
             row = cursor.fetchone()
             if row:
-                user_id, stored_hash, salt, hh_id, email = row
-                pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 260000)
-                if pwd_hash == stored_hash:
-                    return {'id': user_id, 'username': username, 'household_id': hh_id, 'email': email}
-            return None
+                pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), row["salt"], 260000)
+                if pwd_hash == row["password_hash"]:
+                    return True
+            return False
 
     def update_user_email(self, user_id, email):
-        """Used to migrate existing legacy users who logged in without an email."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             conn.execute("UPDATE users SET email = ? WHERE id = ?", (email, user_id))
             conn.commit()
+
+    def get_household_categories(self, household_id):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name_en as en, name_he as he FROM household_categories WHERE household_id = ?", (household_id,))
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
