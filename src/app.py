@@ -39,7 +39,7 @@ if st.query_params.get("trigger_daily_alerts") == "TRUE":
 # ==========================================
 # 2. INITIALIZATION & STATE
 # ==========================================
-db = PantryDatabase()
+db = PantryDatabase("pantry_v1.db")
 engine = PantryDepletionEngine()
 
 def seed_default_categories(h_id):
