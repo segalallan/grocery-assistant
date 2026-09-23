@@ -14,7 +14,7 @@ except ImportError:
     HAS_SORTABLES = False
 
 # Fully class-based import
-from database import PantryDatabase
+from database import PantryDatabase, get_connection, get_household_categories
 from engine import PantryDepletionEngine
 # from parser import ReceiptIngestor
 # from notifications import send_daily_alert
