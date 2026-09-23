@@ -192,15 +192,17 @@ def render_auth_view():
 
     with tab_login:
         with st.form("login_form"):
-            username = st.text_input(L["username"]).strip().lower()
+            # Using Email as the login identifier since Username is removed
+            login_email = st.text_input("Email Address").strip().lower()
             password = st.text_input(L["password"], type="password")
             login_btn = st.form_submit_button(L["sign_in_btn"])
 
             if login_btn:
-                if not username or not password:
-                    st.error("Please enter both username and password.")
+                if not login_email or not password:
+                    st.error("Please enter both email and password.")
                 else:
-                    user = db.verify_user(username, password)
+                    # Backend still checks the 'username' column, which now stores the email
+                    user = db.verify_user(login_email, password)
                     if user:
                         conn = db.get_connection()
                         cursor = conn.cursor()
@@ -209,7 +211,7 @@ def render_auth_view():
                             FROM users u
                             LEFT JOIN households h ON u.household_id = h.id
                             WHERE u.username = ?
-                        """, (username,))
+                        """, (login_email,))
                         full_user = cursor.fetchone()
                         conn.close()
 
@@ -231,25 +233,27 @@ def render_auth_view():
 
     with tab_signup:
         with st.form("signup_form"):
-            new_username = st.text_input(L["choose_user"]).strip().lower()
-            new_display = st.text_input(L["your_name"])
-            new_email = st.text_input("Email Address (Required for alerts)").strip()
+            first_name = st.text_input("First Name").strip()
+            last_name = st.text_input("Last Name").strip()
+            new_email = st.text_input("Email Address").strip().lower()
             new_password = st.text_input(L["password"], type="password")
-            house_name = st.text_input(L["house_name"], placeholder="e.g. Herzliya Apartment")
+            house_name = st.text_input("Household Name", placeholder="e.g. Herzliya Apartment")
 
             signup_btn = st.form_submit_button(L["create_acct_btn"])
 
             if signup_btn:
-                if not new_username or not new_password or not new_display or not new_email or not house_name:
+                if not first_name or not last_name or not new_password or not new_email or not house_name:
                     st.error("Please fill in all fields.")
                 elif "@" not in new_email or "." not in new_email:
                     st.error("Please enter a valid email address.")
                 else:
-                    success = db.create_user(new_username, new_password, house_name, new_email)
+                    # Pass the email as both the 'username' and 'email' arguments to satisfy the database schema
+                    # Note: If you want the First/Last name saved, you will need to update db.create_user() in database.py to accept a display_name variable.
+                    success = db.create_user(new_email, new_password, house_name, new_email)
                     if success:
                         st.success("Account created successfully! Please log in above.")
                     else:
-                        st.error("Username already exists or an error occurred.")
+                        st.error("An account with this email already exists or an error occurred.")
 
 # ==========================================
 # 3. AUTHENTICATION GATES
