@@ -15,7 +15,7 @@ except ImportError:
 
 from database import PantryDatabase
 from engine import PantryDepletionEngine
-from parser import ReceiptIngestor
+# from parser import ReceiptIngestor
 from notifications import send_daily_alert
 
 RECEIPT_SCAN_WEEKLY_LIMIT = 10
