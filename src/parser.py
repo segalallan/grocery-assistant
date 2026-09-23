@@ -12,19 +12,19 @@ import pypdfium2 as pdfium
 from PIL import Image, ImageOps, ImageFilter
 from openai import OpenAI
 
-from database import get_connection, init_db, get_household_categories
+from database import PantryDatabase
 from engine import PantryDepletionEngine
 
 class ReceiptIngestor:
     def __init__(self):
-        init_db()
+        self.db = PantryDatabase("pantry_v1.db")
         self.engine = PantryDepletionEngine()
         self.client = OpenAI()
 
     def process_receipt_item(self, item_name_en: str, item_name_he: str, category: str, purchase_date_str: str, household_id: int, user_name: str = "Household", units: int = 1, conn=None):
         owns_conn = False
         if conn is None:
-            conn = get_connection()
+            conn = self.db.get_connection()
             owns_conn = True
 
         cursor = conn.cursor()
@@ -94,7 +94,7 @@ class ReceiptIngestor:
             conn.close()
 
     def mark_item_depleted_manually(self, inventory_id: int, household_id: int, current_date_str: str, user_name: str = "Household"):
-        conn = get_connection()
+        conn = self.db.get_connection()
         cursor = conn.cursor()
 
         cursor.execute(
@@ -237,7 +237,7 @@ class ReceiptIngestor:
         return base64_images, quality_warnings
 
     def _extract_page_items(self, b64_img: str, household_id: int) -> list[dict]:
-        categories = get_household_categories(household_id)
+        categories = self.db.get_household_categories(household_id)
         cats_formatted = "\n".join([f'- "{c["en"]}" (Hebrew: {c["he"]})' for c in categories])
 
         prompt = f"""
@@ -337,7 +337,7 @@ Return valid JSON:
         return {"items": [merged[k] for k in order], "quality_warnings": quality_warnings}
 
     def parse_raw_text(self, raw_text: str, household_id: int) -> list[dict]:
-        categories = get_household_categories(household_id)
+        categories = self.db.get_household_categories(household_id)
         cats_formatted = "\n".join([f'- "{c["en"]}" (Hebrew: {c["he"]})' for c in categories])
 
         prompt = f"""
