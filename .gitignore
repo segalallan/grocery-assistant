@@ -1,0 +1,9 @@
+.streamlit/
+__pycache__/
+venv/
+.venv/
+pantry.db
+pantry.db-wal
+pantry.db-shm
+data/
+*.csv

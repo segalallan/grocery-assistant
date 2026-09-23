@@ -1,0 +1,16 @@
+name: Daily Pantry Alerts
+
+on:
+  schedule:
+    # Runs at 8:00 AM UTC every day
+    - cron: '0 8 * * *'
+  workflow_dispatch: # Allows you to manually trigger it via GitHub UI for testing
+
+jobs:
+  trigger-alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit Streamlit Webhook
+        # IMPORTANT: Change 'yourapp.streamlit.app' to your actual deployed URL!
+        run: |
+          curl -s "https://yourapp.streamlit.app/?trigger_daily_alerts=TRUE&secret=${{ secrets.CRON_SECRET }}"
