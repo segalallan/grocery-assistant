@@ -43,7 +43,7 @@ db = PantryDatabase()
 engine = PantryDepletionEngine()
 
 def seed_default_categories(h_id):
-    conn = db.get_connection()
+    conn = get_connection()
     c = conn.cursor()
     default_cats = [
         ("Dairy & Eggs", "מוצרי חלב וביצים"),
@@ -204,7 +204,7 @@ def render_auth_view():
                     # Backend still checks the 'username' column, which now stores the email
                     user = db.verify_user(login_email, password)
                     if user:
-                        conn = db.get_connection()
+                        conn = get_connection()
                         cursor = conn.cursor()
                         cursor.execute("""
                             SELECT u.id, u.username, u.display_name, u.household_id, u.email, h.name as household_name, h.household_code
@@ -297,16 +297,16 @@ with head_c2:
         st.session_state["authenticated"] = False
         st.rerun()
 
-categories_raw = db.get_household_categories(household_id)
+categories_raw = get_household_categories(household_id)
 if not categories_raw:
     seed_default_categories(household_id)
-    categories_raw = db.get_household_categories(household_id)
+    categories_raw = get_household_categories(household_id)
 
 cat_en_to_he = {c["en"]: c["he"] for c in categories_raw} if categories_raw else {}
 cat_display_map = {c["en"]: (c["he"] if is_he else c["en"]) for c in categories_raw} if categories_raw else {}
 
 # Fetch Inventory
-conn = db.get_connection()
+conn = get_connection()
 cursor = conn.cursor()
 cursor.execute(
     "SELECT id, item_name_en, item_name_he, category, units, purchase_date, user_lambda FROM inventory WHERE household_id = ?",
@@ -360,7 +360,7 @@ def restock_alert_dialog(candidates, h_id, d_name, today_s):
         b1, b2 = st.columns(2)
         
         if b1.button("🛒 Add to List", use_container_width=True, type="primary"):
-            conn = db.get_connection()
+            conn = get_connection()
             c = conn.cursor()
             c.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_o FROM shopping_list WHERE household_id = ?", (h_id,))
             curr_order = c.fetchone()["max_o"]
@@ -380,7 +380,7 @@ def restock_alert_dialog(candidates, h_id, d_name, today_s):
             st.rerun()
             
         if b2.button("🕰️ Still Going", use_container_width=True):
-            conn = db.get_connection()
+            conn = get_connection()
             c = conn.cursor()
             for i_id in selected_ids:
                 c.execute(
@@ -426,7 +426,7 @@ def merge_dialog_ui(selected_ids, items_list, h_id):
         extra_units = sum([c['units'] for c in children])
         child_ids = [c['id'] for c in children]
         
-        conn = db.get_connection()
+        conn = get_connection()
         c = conn.cursor()
         c.execute("UPDATE inventory SET units = units + ? WHERE id = ?", (extra_units, father['id']))
         placeholders = ",".join("?" * len(child_ids))
@@ -476,7 +476,7 @@ with tab_pantry:
                 final_en = p_name_en.strip() or p_name_he.strip()
                 final_he = p_name_he.strip() or p_name_en.strip()
                 if final_en:
-                    conn = db.get_connection()
+                    conn = get_connection()
                     c = conn.cursor()
                     c.execute(
                         "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
@@ -490,7 +490,7 @@ with tab_pantry:
     with st.expander("📊 Recent Purchases & Mathematical Audit (Last 60 Days)"):
         st.caption("Inspect and export all raw parameters, Bayesian shrinkage calculations, and Weibull probabilities to CSV.")
         
-        conn = db.get_connection()
+        conn = get_connection()
         c = conn.cursor()
         c.execute("""
             SELECT id, item_name_en, item_name_he, category, units, purchase_date, recorded_at, recorded_by
@@ -599,7 +599,7 @@ with tab_pantry:
             b1, b2, b3, b4, b5 = st.columns(5)
             
             if b1.button("🗑️ Delete", use_container_width=True):
-                conn = db.get_connection()
+                conn = get_connection()
                 c = conn.cursor()
                 placeholders = ",".join("?" * len(selected_ids))
                 c.execute(f"DELETE FROM inventory WHERE id IN ({placeholders}) AND household_id = ?", (*selected_ids, household_id))
@@ -613,7 +613,7 @@ with tab_pantry:
                 merge_dialog_ui(selected_ids, pantry_items, household_id)
                 
             if b3.button("🛒 Add to List", use_container_width=True):
-                conn = db.get_connection()
+                conn = get_connection()
                 c = conn.cursor()
                 c.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_o FROM shopping_list WHERE household_id = ?", (household_id,))
                 curr_order = c.fetchone()["max_o"]
@@ -633,7 +633,7 @@ with tab_pantry:
                 st.rerun()
                 
             if b4.button("❌ Ran Out", use_container_width=True):
-                conn = db.get_connection()
+                conn = get_connection()
                 c = conn.cursor()
                 for cid in selected_ids:
                     c.execute("DELETE FROM inventory WHERE id = ? AND household_id = ?", (cid, household_id))
@@ -643,7 +643,7 @@ with tab_pantry:
                 st.rerun()
 
             if b5.button("🕰️ Still Going", use_container_width=True):
-                conn = db.get_connection()
+                conn = get_connection()
                 c = conn.cursor()
                 for cid in selected_ids:
                     c.execute(
@@ -732,7 +732,7 @@ with tab_pantry:
                         curr_cat_idx = [c["en"] for c in categories_raw].index(item["category"]) if item["category"] in [c["en"] for c in categories_raw] else 0
                         new_cat = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], index=curr_cat_idx, format_func=lambda x: cat_display_map.get(x, x))
                         if st.form_submit_button(L["update_btn"]):
-                            conn = db.get_connection()
+                            conn = get_connection()
                             c = conn.cursor()
                             c.execute(
                                 "UPDATE inventory SET item_name_en = ?, item_name_he = ?, category = ?, units = ? WHERE id = ? AND household_id = ?",
@@ -760,7 +760,7 @@ with tab_shopping:
                 final_en = s_name_en.strip() or s_name_he.strip()
                 final_he = s_name_he.strip() or s_name_en.strip()
                 if final_en:
-                    conn = db.get_connection()
+                    conn = get_connection()
                     c = conn.cursor()
                     c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_o FROM shopping_list WHERE household_id = ?", (household_id,))
                     next_o = c.fetchone()["next_o"]
@@ -772,7 +772,7 @@ with tab_shopping:
                     conn.close()
                     st.rerun()
 
-    conn = db.get_connection()
+    conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT id, item_name_en, item_name_he, category, source, sort_order, added_at, added_by FROM shopping_list WHERE household_id = ?", (household_id,))
     shopping_rows = [dict(r) for r in c.fetchall()]
@@ -824,7 +824,7 @@ with tab_shopping:
 
                 reordered = sort_items(current_labels, direction="vertical", key=f"dnd_{household_id}")
                 if reordered and reordered != current_labels:
-                    conn = db.get_connection()
+                    conn = get_connection()
                     c = conn.cursor()
                     for new_idx, lbl in enumerate(reordered):
                         item_id = label_to_id[lbl]
@@ -860,7 +860,7 @@ with tab_shopping:
                         curr_cat_idx = [c["en"] for c in categories_raw].index(row["category"]) if row["category"] in [c["en"] for c in categories_raw] else 0
                         new_s_cat = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], index=curr_cat_idx, format_func=lambda x: cat_display_map.get(x, x))
                         if st.form_submit_button(L["update_btn"]):
-                            conn = db.get_connection()
+                            conn = get_connection()
                             c = conn.cursor()
                             c.execute(
                                 "UPDATE shopping_list SET item_name_en = ?, item_name_he = ?, category = ? WHERE id = ? AND household_id = ?",
@@ -872,7 +872,7 @@ with tab_shopping:
 
             with sc4:
                 if st.button(L["delete_btn"], key=f"del_shop_{row['id']}", help=L["delete_tooltip"]):
-                    conn = db.get_connection()
+                    conn = get_connection()
                     c = conn.cursor()
                     c.execute("DELETE FROM shopping_list WHERE id = ? AND household_id = ?", (row["id"], household_id))
                     conn.commit()
@@ -882,7 +882,7 @@ with tab_shopping:
 
             with sc5:
                 if st.button(L["bought_btn"], key=f"bought_{row['id']}"):
-                    conn = db.get_connection()
+                    conn = get_connection()
                     c = conn.cursor()
                     c.execute(
                         "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
@@ -905,7 +905,7 @@ with tab_categories:
             new_he = st.text_input("Category (Hebrew / עברית)", placeholder="למשל: תחליפי טבעונות")
             submit = st.form_submit_button("Add / הוסף")
             if submit and new_en.strip():
-                conn = db.get_connection()
+                conn = get_connection()
                 c = conn.cursor()
                 try:
                     c.execute("INSERT INTO household_categories (household_id, name_en, name_he) VALUES (?, ?, ?)", 
@@ -924,7 +924,7 @@ with tab_categories:
                     st.markdown(f"• **{cat['en']}** / {cat['he']}")
                 with c2:
                     if st.button("🗑️", key=f"del_cat_{cat['en']}"):
-                        conn = db.get_connection()
+                        conn = get_connection()
                         c = conn.cursor()
                         c.execute("DELETE FROM household_categories WHERE household_id = ? AND name_en = ?", (household_id, cat["en"]))
                         conn.commit()
