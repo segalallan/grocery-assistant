@@ -22,7 +22,7 @@ RECEIPT_SCAN_WEEKLY_LIMIT = 10
 
 st.set_page_config(page_title="Smart Pantry Assistant", layout="wide")
 
-init_db()
+db = PantryDatabase()
 engine = PantryDepletionEngine()
 ingestor = ReceiptIngestor()
 
@@ -1115,7 +1115,7 @@ if st.session_state["staged_receipt_items"]:
                 st.session_state["staged_filename"] = ""
                 st.rerun()
     st.markdown("---")
-    db = PantryDatabase()
+    
 
 # ==========================================
 # 1. THE HIDDEN WEBHOOK ENDPOINT (RUN FIRST)
