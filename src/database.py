@@ -101,7 +101,7 @@ class PantryDatabase:
             """)
             conn.commit()
 
-    def create_user(self, email, password, household_name, ignored_email=None):
+    def create_user(self, email, password, first_name, last_name, household_name):
         """Creates a new user, hashes password, generates household, and saves email."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -113,7 +113,8 @@ class PantryDatabase:
             cursor.execute("INSERT INTO households (household_code, name) VALUES (?, ?)", (hh_code, household_name))
             hh_id = cursor.lastrowid
             
-            display_name = email.split("@")[0].capitalize()
+            # Combine First and Last name for the display name
+            display_name = f"{first_name} {last_name}".strip()
             
             try:
                 cursor.execute("""
@@ -124,6 +125,16 @@ class PantryDatabase:
                 return True
             except sqlite3.IntegrityError:
                 return False 
+
+    def change_password(self, email, new_password):
+        """Updates a user's password."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            salt = os.urandom(16)
+            pwd_hash = hashlib.pbkdf2_hmac('sha256', new_password.encode('utf-8'), salt, 260000)
+            cursor.execute("UPDATE users SET password_hash = ?, salt = ? WHERE username = ?", (pwd_hash, salt, email))
+            conn.commit()
+            return cursor.rowcount > 0 
 
     def verify_user(self, username, password):
         with self.get_connection() as conn:

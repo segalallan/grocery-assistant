@@ -16,7 +16,7 @@ except ImportError:
 # Fully class-based import
 from database import PantryDatabase
 from engine import PantryDepletionEngine
-# from parser import ReceiptIngestor
+from parser import ReceiptIngestor
 # from notifications import send_daily_alert
 
 RECEIPT_SCAN_WEEKLY_LIMIT = 10
@@ -41,6 +41,7 @@ if st.query_params.get("trigger_daily_alerts") == "TRUE":
 # ==========================================
 db = PantryDatabase("pantry_v1.db")
 engine = PantryDepletionEngine()
+ingestor = ReceiptIngestor()
 
 def seed_default_categories(h_id):
     conn = db.get_connection()
@@ -188,20 +189,16 @@ def render_auth_view():
     st.title(L["title"])
     st.subheader(L["login_sub"])
 
-    tab_login, tab_signup = st.tabs([L["tab_login"], L["tab_signup"]])
+    tab_login, tab_signup, tab_reset = st.tabs([L["tab_login"], L["tab_signup"], "🔄 Reset Password"])
 
     with tab_login:
         with st.form("login_form"):
-            # Using Email as the login identifier since Username is removed
             login_email = st.text_input("Email Address").strip().lower()
             password = st.text_input(L["password"], type="password")
-            login_btn = st.form_submit_button(L["sign_in_btn"])
-
-            if login_btn:
+            if st.form_submit_button(L["sign_in_btn"]):
                 if not login_email or not password:
                     st.error("Please enter both email and password.")
                 else:
-                    # Backend still checks the 'username' column, which now stores the email
                     user = db.verify_user(login_email, password)
                     if user:
                         conn = db.get_connection()
@@ -224,10 +221,7 @@ def render_auth_view():
                             st.session_state["household_name"] = full_user["household_name"]
                             st.session_state["household_code"] = full_user["household_code"]
                             st.session_state["email"] = full_user["email"]
-                            st.success("Welcome back!")
                             st.rerun()
-                        else:
-                            st.error("Account structure invalid.")
                     else:
                         st.error("Invalid credentials.")
 
@@ -239,21 +233,32 @@ def render_auth_view():
             new_password = st.text_input(L["password"], type="password")
             house_name = st.text_input("Household Name", placeholder="e.g. Herzliya Apartment")
 
-            signup_btn = st.form_submit_button(L["create_acct_btn"])
-
-            if signup_btn:
+            if st.form_submit_button(L["create_acct_btn"]):
                 if not first_name or not last_name or not new_password or not new_email or not house_name:
                     st.error("Please fill in all fields.")
                 elif "@" not in new_email or "." not in new_email:
                     st.error("Please enter a valid email address.")
                 else:
-                    # Pass the email as both the 'username' and 'email' arguments to satisfy the database schema
-                    # Note: If you want the First/Last name saved, you will need to update db.create_user() in database.py to accept a display_name variable.
-                    success = db.create_user(new_email, new_password, house_name, new_email)
+                    # Pass the first and last name to the DB to create the display name
+                    success = db.create_user(new_email, new_password, first_name, last_name, house_name)
                     if success:
                         st.success("Account created successfully! Please log in above.")
                     else:
-                        st.error("An account with this email already exists or an error occurred.")
+                        st.error("An account with this email already exists.")
+
+    with tab_reset:
+        with st.form("reset_form"):
+            st.write("Forgot your password? Enter your email to set a new one.")
+            reset_email = st.text_input("Account Email").strip().lower()
+            new_pass = st.text_input("New Password", type="password")
+            if st.form_submit_button("Change Password"):
+                if reset_email and new_pass:
+                    if db.change_password(reset_email, new_pass):
+                        st.success("Password updated successfully! You can now log in.")
+                    else:
+                        st.error("Email not found in our system.")
+                else:
+                    st.error("Please fill in both fields.")
 
 # ==========================================
 # 3. AUTHENTICATION GATES
@@ -962,3 +967,69 @@ with tab_curves:
 
         fig.update_layout(xaxis_title="Days Since Purchase", yaxis_title="Probability S(t)", template="plotly_white")
         st.plotly_chart(fig, use_container_width=True)
+
+# --- SIDEBAR QUICK PASTE LIST ---
+st.sidebar.header("📋 Quick Add List")
+st.sidebar.caption("Paste a text list of groceries to add them all at once.")
+pasted_text = st.sidebar.text_area("Items (one per line):", placeholder="Milk\nEggs\nBread", height=140)
+paste_date = st.sidebar.date_input("Purchase Date", value=today, key="paste_date_input")
+
+if st.sidebar.button("⚡ Process List", type="primary"):
+    if pasted_text.strip():
+        with st.spinner("Structuring items with AI..."):
+            raw_items = ingestor.parse_raw_text(pasted_text, household_id)
+            if raw_items:
+                for idx, it in enumerate(raw_items):
+                    it["include"] = True
+                    it["idx"] = idx
+                    if "units" not in it:
+                        it["units"] = 1
+                st.session_state["staged_receipt_items"] = raw_items
+                st.session_state["staged_purchase_date"] = paste_date.strftime("%Y-%m-%d")
+                st.rerun()
+    else:
+        st.sidebar.error("Paste some items first.")
+
+# --- SIDE-BY-SIDE VERIFICATION WORKSPACE ---
+if st.session_state.get("staged_receipt_items"):
+    st.markdown("---")
+    st.subheader("🧾 List Verification Workspace")
+    st.caption("Verify extracted items and quantities before committing them to the household inventory.")
+
+    edited_df = st.data_editor(
+        pd.DataFrame(st.session_state["staged_receipt_items"])[["include", "item_name_en", "item_name_he", "category", "units"]],
+        column_config={
+            "include": st.column_config.CheckboxColumn("Keep?", default=True),
+            "item_name_en": st.column_config.TextColumn("English Name"),
+            "item_name_he": st.column_config.TextColumn("Hebrew Name"),
+            "category": st.column_config.SelectboxColumn("Category", options=[c["en"] for c in categories_raw] if categories_raw else []),
+            "units": st.column_config.NumberColumn("Qty", min_value=1, step=1, default=1)
+        },
+        hide_index=True,
+        use_container_width=True,
+        key="staged_editor_list"
+    )
+
+    btn_c1, btn_c2 = st.columns([1, 1])
+    with btn_c1:
+        if st.button("✅ Commit Items to Pantry", type="primary"):
+            conn = db.get_connection()
+            try:
+                c = conn.cursor()
+                for _, row in edited_df.iterrows():
+                    if row["include"]:
+                        c.execute(
+                            "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
+                            (household_id, row["item_name_en"], row["item_name_he"], row["category"], int(row["units"]), st.session_state["staged_purchase_date"])
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+            st.session_state["staged_receipt_items"] = None
+            st.success("All verified items added to pantry!")
+            st.rerun()
+
+    with btn_c2:
+        if st.button("❌ Discard List"):
+            st.session_state["staged_receipt_items"] = None
+            st.rerun()
