@@ -65,6 +65,7 @@ def send_daily_alert(recipient_email, household_name, high_risk_items):
 
 def process_all_daily_alerts(db, engine):
     """Scans the database headlessly and passes data to your HTML email sender."""
+    # Force connection to the correct v1 database path
     conn = db.get_connection()
     c = conn.cursor()
     
@@ -75,6 +76,7 @@ def process_all_daily_alerts(db, engine):
         WHERE u.email IS NOT NULL
     """)
     users = [dict(r) for r in c.fetchall()]
+    print(f"DEBUG: Found {len(users)} users with emails in database.")
     
     today = date.today()
     emails_sent = 0
@@ -82,6 +84,7 @@ def process_all_daily_alerts(db, engine):
     for user in users:
         c.execute("SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda FROM inventory WHERE household_id = ?", (user["household_id"],))
         items = [dict(r) for r in c.fetchall()]
+        print(f"DEBUG: Found {len(items)} items in inventory for household {user['household_name']}.")
         
         high_risk_items = []
         for it in items:
@@ -89,12 +92,14 @@ def process_all_daily_alerts(db, engine):
             days_el = (today - p_date).days
             units_qty = max(1, it["units"] or 1)
             prob = engine.compute_depletion_probability(it["category"], days_el, it["user_lambda"], units_qty)
+            print(f"DEBUG: Item {it['item_name_en']} has depletion risk {prob:.2f}")
             
             if prob >= 0.65:
                 name = it["item_name_he"] if it["item_name_he"] else it["item_name_en"]
                 high_risk_items.append({'name': name, 'risk': prob, 'days': days_el})
         
         if high_risk_items:
+            print(f"DEBUG: Sending alert to {user['email']} with {len(high_risk_items)} high risk items.")
             if send_daily_alert(user["email"], user["household_name"], high_risk_items):
                 emails_sent += 1
                 
