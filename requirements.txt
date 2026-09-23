@@ -7,3 +7,13 @@ scipy
 pypdfium2
 opencv-python-headless
 Pillow
+streamlit
+pandas
+numpy
+plotly
+lifelines
+scipy
+pypdfium2
+opencv-python-headless
+Pillow
+openai
