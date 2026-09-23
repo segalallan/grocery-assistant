@@ -2,23 +2,21 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import streamlit as st
+from datetime import datetime, date
 
 def send_daily_alert(recipient_email, household_name, high_risk_items):
-    """
-    Connects to Gmail securely and sends an HTML restock alert.
-    high_risk_items should be a list of dicts: [{'name': 'Milk', 'risk': 0.88, 'days': 14}, ...]
-    """
+    """Connects to Gmail securely and sends an HTML restock alert."""
     if not high_risk_items or not recipient_email:
-        return 
+        return False
         
     try:
-        sender_email = st.secrets["smartpantry.alerts@gmail.com"]
-        app_password = st.secrets["fbvascjjfnjlprrv"]
+        # We now pull the secrets by their variable names, not their values
+        sender_email = st.secrets["EMAIL_SENDER"]
+        app_password = st.secrets["EMAIL_PASSWORD"]
     except KeyError:
         print("CRITICAL: Streamlit secrets for GMAIL are missing. Email aborted.")
-        return
+        return False
 
-    # Build the HTML email
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Pantry Alert: Restock required for {household_name}"
     msg["From"] = sender_email
@@ -55,10 +53,50 @@ def send_daily_alert(recipient_email, household_name, high_risk_items):
     msg.attach(MIMEText(html_content, "html"))
 
     try:
-        # Connect to Gmail's secure SMTP server
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(sender_email, app_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
         print(f"Alert sent successfully to {recipient_email}")
+        return True
     except Exception as e:
         print(f"Failed to send email to {recipient_email}: {e}")
+        return False
+
+
+def process_all_daily_alerts(db, engine):
+    """Scans the database headlessly and passes data to your HTML email sender."""
+    conn = db.get_connection()
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT u.email, u.household_id, h.name as household_name 
+        FROM users u
+        JOIN households h ON u.household_id = h.id
+        WHERE u.email IS NOT NULL
+    """)
+    users = [dict(r) for r in c.fetchall()]
+    
+    today = date.today()
+    emails_sent = 0
+    
+    for user in users:
+        c.execute("SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda FROM inventory WHERE household_id = ?", (user["household_id"],))
+        items = [dict(r) for r in c.fetchall()]
+        
+        high_risk_items = []
+        for it in items:
+            p_date = datetime.strptime(it["purchase_date"], "%Y-%m-%d").date()
+            days_el = (today - p_date).days
+            units_qty = max(1, it["units"] or 1)
+            prob = engine.compute_depletion_probability(it["category"], days_el, it["user_lambda"], units_qty)
+            
+            if prob >= 0.65:
+                name = it["item_name_he"] if it["item_name_he"] else it["item_name_en"]
+                high_risk_items.append({'name': name, 'risk': prob, 'days': days_el})
+        
+        if high_risk_items:
+            if send_daily_alert(user["email"], user["household_name"], high_risk_items):
+                emails_sent += 1
+                
+    conn.close()
+    return f"Sent {emails_sent} alerts."

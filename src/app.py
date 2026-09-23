@@ -17,7 +17,7 @@ except ImportError:
 from database import PantryDatabase
 from engine import PantryDepletionEngine
 from parser import ReceiptIngestor
-# from notifications import send_daily_alert
+from notifications import process_all_daily_alerts
 
 RECEIPT_SCAN_WEEKLY_LIMIT = 10
 
@@ -29,8 +29,12 @@ st.set_page_config(page_title="Smart Pantry Assistant", layout="wide")
 if st.query_params.get("trigger_daily_alerts") == "TRUE":
     secret_key = st.query_params.get("secret")
     if secret_key == st.secrets.get("CRON_SECRET"):
-        st.write("Authorized: Running daily alerts...")
-        st.success("Daily alerts triggered and sent.")
+        db_inst = PantryDatabase("pantry_v1.db")
+        eng_inst = PantryDepletionEngine()
+
+        result = process_all_daily_alerts(db_inst, eng_inst)
+
+        st.success(f"Daily alerts triggered: {result}")
         st.stop()
     else:
         st.error("Unauthorized webhook call.")
