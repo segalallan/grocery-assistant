@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_SORTABLES = False
 
-from database import PantryDatabase
+from database import PantryDatabase, get_connection, verify_password, hash_password, get_household_categories, seed_default_categories
 from engine import PantryDepletionEngine
 # from parser import ReceiptIngestor
 from notifications import send_daily_alert
@@ -22,11 +22,28 @@ RECEIPT_SCAN_WEEKLY_LIMIT = 10
 
 st.set_page_config(page_title="Smart Pantry Assistant", layout="wide")
 
+# ==========================================
+# 1. THE HIDDEN WEBHOOK ENDPOINT (MUST RUN FIRST)
+# ==========================================
+if st.query_params.get("trigger_daily_alerts") == "TRUE":
+    secret_key = st.query_params.get("secret")
+    if secret_key == st.secrets.get("CRON_SECRET"):
+        st.write("Authorized: Running daily alerts...")
+        # Note: In a full production app, you would query db for all households, 
+        # run engine.compute_depletion_probability(), filter items > 85%, and email them.
+        st.success("Daily alerts triggered and sent.")
+        st.stop() # Prevents Streamlit from rendering the UI to GitHub Actions
+    else:
+        st.error("Unauthorized webhook call.")
+        st.stop()
+
+# ==========================================
+# 2. INITIALIZATION & STATE
+# ==========================================
 db = PantryDatabase()
 engine = PantryDepletionEngine()
-ingestor = ReceiptIngestor()
+# ingestor = ReceiptIngestor()
 
-# --- LOCALIZATION STRINGS ---
 TRANSLATIONS = {
     "en": {
         "title": "🛒 Smart Pantry Assistant",
@@ -142,6 +159,7 @@ if "authenticated" not in st.session_state:
     st.session_state["household_id"] = None
     st.session_state["household_name"] = None
     st.session_state["household_code"] = None
+    st.session_state["email"] = None
 
 if "lang" not in st.session_state:
     st.session_state["lang"] = "en"
@@ -183,7 +201,7 @@ def render_auth_view():
                     conn = get_connection()
                     cursor = conn.cursor()
                     cursor.execute("""
-                        SELECT u.id, u.username, u.password_hash, u.display_name, u.household_id, h.name as household_name, h.household_code
+                        SELECT u.id, u.username, u.password_hash, u.display_name, u.household_id, u.email, h.name as household_name, h.household_code
                         FROM users u
                         JOIN households h ON u.household_id = h.id
                         WHERE u.username = ?
@@ -199,6 +217,7 @@ def render_auth_view():
                         st.session_state["household_id"] = user["household_id"]
                         st.session_state["household_name"] = user["household_name"]
                         st.session_state["household_code"] = user["household_code"]
+                        st.session_state["email"] = user["email"]
                         st.success("Welcome back!")
                         st.rerun()
                     else:
@@ -209,6 +228,7 @@ def render_auth_view():
         with st.form("signup_form"):
             new_username = st.text_input(L["choose_user"]).strip().lower()
             new_display = st.text_input(L["your_name"])
+            new_email = st.text_input("Email Address (Required for alerts)").strip()
             new_password = st.text_input(L["password"], type="password")
 
             if signup_mode == L["create_house"]:
@@ -221,8 +241,10 @@ def render_auth_view():
             signup_btn = st.form_submit_button(L["create_acct_btn"])
 
             if signup_btn:
-                if not new_username or not new_password or not new_display:
+                if not new_username or not new_password or not new_display or not new_email:
                     st.error("Please fill in all fields.")
+                elif "@" not in new_email or "." not in new_email:
+                    st.error("Please enter a valid email address.")
                 else:
                     conn = get_connection()
                     cursor = conn.cursor()
@@ -248,18 +270,39 @@ def render_auth_view():
                             household_id = house["id"]
 
                         cursor.execute("""
-                            INSERT INTO users (username, password_hash, household_id, display_name)
-                            VALUES (?, ?, ?, ?)
-                        """, (new_username, hash_password(new_password), household_id, new_display))
+                            INSERT INTO users (username, password_hash, household_id, display_name, email)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (new_username, hash_password(new_password), household_id, new_display, new_email))
                         conn.commit()
                         conn.close()
                         st.success("Account created successfully! Please log in above.")
 
+# ==========================================
+# 3. AUTHENTICATION GATES
+# ==========================================
 if not st.session_state["authenticated"]:
     render_auth_view()
     st.stop()
 
-# --- APP CONTEXT ---
+@st.dialog("Missing Account Details")
+def email_intercept_dialog(user_id):
+    st.warning("Welcome back! Before we continue, we're adding daily restock alerts. Please link a valid email address to your account.")
+    new_email = st.text_input("Email Address")
+    if st.button("Save Email"):
+        if "@" in new_email and "." in new_email:
+            db.update_user_email(user_id, new_email)
+            st.session_state["email"] = new_email
+            st.rerun()
+        else:
+            st.error("Please enter a valid email format.")
+
+if not st.session_state.get("email"):
+    email_intercept_dialog(st.session_state["user_id"])
+    st.stop()
+
+# ==========================================
+# 4. APP DASHBOARD LOGIC
+# ==========================================
 household_id = st.session_state["household_id"]
 display_name = st.session_state["display_name"]
 household_name = st.session_state["household_name"]
@@ -455,15 +498,14 @@ with tab_pantry:
                 final_en = p_name_en.strip() or p_name_he.strip()
                 final_he = p_name_he.strip() or p_name_en.strip()
                 if final_en:
-                    ingestor.process_receipt_item(
-                        item_name_en=final_en,
-                        item_name_he=final_he,
-                        category=p_cat_en,
-                        purchase_date_str=p_date.strftime("%Y-%m-%d"),
-                        household_id=household_id,
-                        user_name=display_name,
-                        units=int(p_qty)
+                    conn = get_connection()
+                    c = conn.cursor()
+                    c.execute(
+                        "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
+                        (household_id, final_en, final_he, p_cat_en, int(p_qty), p_date.strftime("%Y-%m-%d"))
                     )
+                    conn.commit()
+                    conn.close()
                     st.success("Item added to pantry!")
                     st.rerun()
 
@@ -481,7 +523,6 @@ with tab_pantry:
         """, (household_id, today_str))
         recent_purchases_rows = [dict(r) for r in c.fetchall()]
         
-        # Fallback backfill from active inventory if purchases ledger was just initialized
         if not recent_purchases_rows:
             c.execute("""
                 SELECT id, item_name_en, item_name_he, category, units, purchase_date, 'inventory' as recorded_at, 'system' as recorded_by
@@ -617,9 +658,13 @@ with tab_pantry:
                 st.rerun()
                 
             if b4.button("❌ Ran Out", use_container_width=True):
+                conn = get_connection()
+                c = conn.cursor()
                 for cid in selected_ids:
-                    ingestor.mark_item_depleted_manually(cid, household_id, today_str, user_name=display_name)
+                    c.execute("DELETE FROM inventory WHERE id = ? AND household_id = ?", (cid, household_id))
                     st.session_state[f"chk_{cid}"] = False
+                conn.commit()
+                conn.close()
                 st.rerun()
 
             if b5.button("🕰️ Still Going", use_container_width=True):
@@ -862,17 +907,12 @@ with tab_shopping:
 
             with sc5:
                 if st.button(L["bought_btn"], key=f"bought_{row['id']}"):
-                    ingestor.process_receipt_item(
-                        item_name_en=row["item_name_en"],
-                        item_name_he=row["item_name_he"],
-                        category=row["category"],
-                        purchase_date_str=today_str,
-                        household_id=household_id,
-                        user_name=display_name,
-                        units=1
-                    )
                     conn = get_connection()
                     c = conn.cursor()
+                    c.execute(
+                        "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
+                        (household_id, row["item_name_en"], row["item_name_he"], row["category"], 1, today_str)
+                    )
                     c.execute("DELETE FROM shopping_list WHERE id = ? AND household_id = ?", (row["id"], household_id))
                     conn.commit()
                     conn.close()
@@ -947,315 +987,166 @@ with tab_curves:
         fig.update_layout(xaxis_title="Days Since Purchase", yaxis_title="Probability S(t)", template="plotly_white")
         st.plotly_chart(fig, use_container_width=True)
 
-# --- SIDEBAR RECEIPT UPLOAD & STAGED CONFIRMATION ---
-st.sidebar.header(L["sidebar_receipt"])
-
-receipt_mode = st.sidebar.radio("Ingestion Method:", [
-    "📷 Upload Receipt (PDF / Photo)", 
-    "📋 Quick Paste List"
-])
-
-if receipt_mode == "📷 Upload Receipt (PDF / Photo)":
-    with st.sidebar.expander(L["upload_label"], expanded=True):
-        scans_used = count_receipt_scans_last_7_days(st.session_state["user_id"])
-        scans_left = max(0, RECEIPT_SCAN_WEEKLY_LIMIT - scans_used)
-        st.caption(f"📊 {scans_left}/{RECEIPT_SCAN_WEEKLY_LIMIT} receipt scans left this week")
-
-        uploaded_file = st.file_uploader(L["upload_label"], type=["png", "jpg", "jpeg", "pdf"], key="receipt_uploader")
-        ocr_date = st.date_input(L["purchase_date"], value=today, key="ocr_date_input")
-
-        if st.button(L["scan_btn"], type="primary"):
-            if uploaded_file is None:
-                st.error("Select a file first.")
-            elif scans_left <= 0:
-                st.error(
-                    f"You've used all {RECEIPT_SCAN_WEEKLY_LIMIT} receipt scans available this week. "
-                    "This limit resets on a rolling 7-day basis - try again later."
-                )
-            else:
-                record_receipt_scan(st.session_state["user_id"], household_id)
-
-                with st.status("🧾 Initializing OCR Pipeline...", expanded=True) as status:
-                    def update_status(msg):
-                        status.write(msg)
-
-                    file_bytes = uploaded_file.read()
-                    result = ingestor.parse_preview(
-                        file_bytes=file_bytes,
-                        filename=uploaded_file.name,
-                        household_id=household_id,
-                        status_callback=update_status
-                    )
-                    raw_items = result["items"]
-                    quality_warnings = result["quality_warnings"]
-
-                    if raw_items:
-                        for idx, it in enumerate(raw_items):
-                            it["include"] = True
-                            it["idx"] = idx
-                            if "units" not in it:
-                                it["units"] = 1
-                                
-                        st.session_state["staged_receipt_items"] = raw_items
-                        st.session_state["staged_purchase_date"] = ocr_date.strftime("%Y-%m-%d")
-                        st.session_state["staged_file_bytes"] = file_bytes
-                        st.session_state["staged_filename"] = uploaded_file.name
-                        
-                        status.update(label="✅ Ingestion Complete!", state="complete", expanded=False)
-                        if quality_warnings:
-                            st.warning("Some pages were too blurry/dark to read and were skipped - see details above. Consider re-scanning just those pages.")
-                        st.rerun()
-                    elif quality_warnings:
-                        status.update(label="⚠️ Image too unclear to read", state="error", expanded=True)
-                        st.warning("This photo is too blurry, dark, or low-resolution to read reliably. Please retake it in better lighting, hold the phone steadier, and make sure the receipt fills the frame, then re-upload.")
-                    else:
-                        status.update(label="⚠️ No items detected", state="error", expanded=True)
-                        st.warning("No food items detected.")
-
-else:
-    with st.sidebar.expander("Paste Grocery Items", expanded=True):
-        pasted_text = st.text_area("Paste items (one per line):", placeholder="חלב 3%\nביצים 18 יח'\nנקניקיות עוף\nצ'יפס קפוא 2 ק\"ג\nפיתות", height=140)
-        paste_date = st.date_input("Purchase Date", value=today, key="paste_date_input")
-
-        if st.button("⚡ Ingest Pasted Items", type="primary"):
-            if pasted_text.strip():
-                with st.spinner("Structuring items with GPT-4o..."):
-                    raw_items = ingestor.parse_raw_text(pasted_text, household_id)
-                    if raw_items:
-                        for idx, it in enumerate(raw_items):
-                            it["include"] = True
-                            it["idx"] = idx
-                            if "units" not in it:
-                                it["units"] = 1
-                        st.session_state["staged_receipt_items"] = raw_items
-                        st.session_state["staged_purchase_date"] = paste_date.strftime("%Y-%m-%d")
-                        st.session_state["staged_file_bytes"] = None
-                        st.session_state["staged_filename"] = ""
-                        st.rerun()
-            else:
-                st.error("Paste some items first.")
-
-# --- SIDE-BY-SIDE VERIFICATION WORKSPACE ---
-if st.session_state["staged_receipt_items"]:
-    st.markdown("---")
-    st.subheader("🧾 Receipt Review & Verification Workspace")
-    st.caption("Verify extracted items and quantities before committing them to the household inventory.")
-
-    col_view_doc, col_view_table = st.columns([1, 1])
-
-    with col_view_doc:
-        st.markdown("**Original Receipt Document:**")
-        file_bytes = st.session_state.get("staged_file_bytes")
-        filename = st.session_state.get("staged_filename", "").lower()
-
-        if file_bytes:
-            if filename.endswith(".pdf"):
-                try:
-                    pdf = pdfium.PdfDocument(file_bytes)
-                    for p_idx, page in enumerate(pdf):
-                        st.image(
-                            page.render(scale=1.5).to_pil(),
-                            caption=f"Receipt Page {p_idx + 1}",
-                            use_container_width=True
-                        )
-                except Exception as e:
-                    st.error(f"Error rendering PDF preview: {e}")
-            else:
-                st.image(file_bytes, caption="Uploaded Image", use_container_width=True)
-        else:
-            st.info("Pasted items mode (no document file uploaded).")
-
-    with col_view_table:
-        st.markdown("**Detected Grocery Items:**")
-        staged = st.session_state["staged_receipt_items"]
-        edited_df = st.data_editor(
-            pd.DataFrame(staged)[["include", "item_name_en", "item_name_he", "category", "units"]],
-            column_config={
-                "include": st.column_config.CheckboxColumn("Keep?", default=True),
-                "item_name_en": st.column_config.TextColumn("English Name"),
-                "item_name_he": st.column_config.TextColumn("Hebrew Name"),
-                "category": st.column_config.SelectboxColumn("Category", options=[c["en"] for c in categories_raw]),
-                "units": st.column_config.NumberColumn("Qty", min_value=1, step=1, default=1)
-            },
-            hide_index=True,
-            use_container_width=True,
-            key="staged_editor_sidebyside"
-        )
-
-        btn_c1, btn_c2 = st.columns([1, 1])
-        with btn_c1:
-            if st.button("✅ Commit Items to Pantry", type="primary"):
-                conn = get_connection()
-                try:
-                    for _, row in edited_df.iterrows():
-                        if row["include"]:
-                            ingestor.process_receipt_item(
-                                item_name_en=row["item_name_en"],
-                                item_name_he=row["item_name_he"],
-                                category=row["category"],
-                                purchase_date_str=st.session_state["staged_purchase_date"],
-                                household_id=household_id,
-                                user_name=display_name,
-                                units=int(row["units"]),
-                                conn=conn
-                            )
-                    conn.commit()
-                finally:
-                    conn.close()
-                st.session_state["staged_receipt_items"] = None
-                st.session_state["staged_file_bytes"] = None
-                st.session_state["staged_filename"] = ""
-                st.success("All verified items added to pantry!")
-                st.rerun()
-
-        with btn_c2:
-            if st.button("❌ Discard Scan"):
-                st.session_state["staged_receipt_items"] = None
-                st.session_state["staged_file_bytes"] = None
-                st.session_state["staged_filename"] = ""
-                st.rerun()
-    st.markdown("---")
-    
-
-# ==========================================
-# 1. THE HIDDEN WEBHOOK ENDPOINT (RUN FIRST)
-# ==========================================
-if st.query_params.get("trigger_daily_alerts") == "TRUE":
-    secret_key = st.query_params.get("secret")
-    if secret_key == st.secrets.get("CRON_SECRET"):
-        st.write("Authorized: Running daily alerts...")
-        # Note: In a full production app, you would query db for all households, 
-        # run engine.compute_depletion_probability(), filter items > 85%, and email them.
-        st.success("Daily alerts triggered and sent.")
-        st.stop() # Prevents Streamlit from rendering the UI
-    else:
-        st.error("Unauthorized webhook call.")
-        st.stop()
-
-
-# ==========================================
-# 2. DIALOGS & OVERLAYS (Must be defined top-level)
-# ==========================================
-@st.dialog("Missing Account Details")
-def email_intercept_dialog(user_id):
-    st.warning("Welcome back! Before we continue, we're adding daily restock alerts. Please link a valid email address to your account.")
-    new_email = st.text_input("Email Address")
-    if st.button("Save Email"):
-        if "@" in new_email and "." in new_email:
-            db.update_user_email(user_id, new_email)
-            st.session_state.current_user['email'] = new_email
-            st.rerun()
-        else:
-            st.error("Please enter a valid email format.")
-
-@st.dialog("Review Ingested Items", width="large")
-def confirmation_dialog():
-    st.write("Please review the items extracted from your input:")
-    
-    # Render the editable table
-    edited_data = st.data_editor(st.session_state.pending_items, use_container_width=True) 
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Confirm & Add to Pantry", use_container_width=True, type="primary"):
-            # TODO: Save edited_data rows into your database inventory table here
-            st.session_state.pending_items = None
-            st.session_state.show_confirm = False
-            st.success("Items successfully added!")
-            st.rerun()
-    with col2:
-        if st.button("Discard", use_container_width=True):
-            st.session_state.pending_items = None
-            st.session_state.show_confirm = False
-            st.rerun()
-
-
-# ==========================================
-# 3. MAIN APP LOGIC
-# ==========================================
-
-# Initialize session state for login
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-
-if not st.session_state.logged_in:
-    st.title("Smart Pantry Login")
-    tab1, tab2 = st.tabs(["Login", "Sign Up"])
-    
-    with tab1:
-        log_user = st.text_input("Username", key="log_user")
-        log_pwd = st.text_input("Password", type="password", key="log_pwd")
-        if st.button("Login"):
-            user_data = db.verify_user(log_user, log_pwd)
-            if user_data:
-                st.session_state.logged_in = True
-                st.session_state.current_user = user_data
-                st.rerun()
-            else:
-                st.error("Invalid credentials")
-
-    with tab2:
-        st.write("Create a new household.")
-        new_user = st.text_input("Username")
-        new_pwd = st.text_input("Password", type="password")
-        new_hh = st.text_input("Household Name (e.g. 'Smith Family Pantry')")
-        new_email = st.text_input("Email Address (Required for alerts)")
-        
-        if st.button("Sign Up"):
-            if new_user and new_pwd and new_hh and "@" in new_email:
-                if db.create_user(new_user, new_pwd, new_hh, new_email):
-                    st.success("Account created! You can now login.")
-                else:
-                    st.error("Username already exists.")
-            else:
-                st.error("Please fill all fields with a valid email.")
-else:
-    # --- EMAIL INTERCEPT CHECK ---
-    # If a legacy user logged in and has a NULL email, block the app.
-    if not st.session_state.current_user.get('email'):
-        email_intercept_dialog(st.session_state.current_user['id'])
-        st.stop() 
-
-    # --- MAIN DASHBOARD ---
-    st.title(f"Dashboard: {st.session_state.current_user.get('username')}")
-    st.write("Welcome to your Smart Pantry!")
-
-    st.divider()
-
-    st.subheader("Add Groceries")
-    
-    # OCR Upload Hidden for V1 Launch
-    # st.info("Camera & Receipt Scanning is currently offline for maintenance.")
-    # st.file_uploader("Upload Receipt Image", type=["jpg", "png", "pdf"])
-
-    # Setup session state for the quick paste box so it can wipe itself clean
-    if "quick_paste" not in st.session_state:
-        st.session_state.quick_paste = ""
-    if "show_confirm" not in st.session_state:
-        st.session_state.show_confirm = False
-
-    def process_quick_paste():
-        text_input = st.session_state.quick_paste
-        if text_input.strip():
-            # In a real app, call your parser here. E.g.:
-            # st.session_state.pending_items = parse_text(text_input)
-            
-            # Dummy data for demonstration:
-            st.session_state.pending_items = [{"Item": "Whole Milk", "Qty": 1}, {"Item": "Bread", "Qty": 2}]
-            
-            # 1. Instantly clear the text box residue!
-            st.session_state.quick_paste = "" 
-            # 2. Trigger the modal dialog overlay
-            st.session_state.show_confirm = True
-
-    st.text_area("Paste receipt text here:", key="quick_paste")
-    st.button("Ingest Text", on_click=process_quick_paste)
-
-    # Pop the dialog if active
-    if st.session_state.show_confirm:
-        confirmation_dialog()
-
-    if st.button("Logout"):
-        st.session_state.logged_in = False
-        st.session_state.current_user = None
-        st.rerun()
+# --- SIDEBAR RECEIPT UPLOAD & STAGED CONFIRMATION (DISABLED FOR V1) ---
+# st.sidebar.header(L["sidebar_receipt"])
+# 
+# receipt_mode = st.sidebar.radio("Ingestion Method:", [
+#     "📷 Upload Receipt (PDF / Photo)", 
+#     "📋 Quick Paste List"
+# ])
+# 
+# if receipt_mode == "📷 Upload Receipt (PDF / Photo)":
+#     with st.sidebar.expander(L["upload_label"], expanded=True):
+#         scans_used = count_receipt_scans_last_7_days(st.session_state["user_id"])
+#         scans_left = max(0, RECEIPT_SCAN_WEEKLY_LIMIT - scans_used)
+#         st.caption(f"📊 {scans_left}/{RECEIPT_SCAN_WEEKLY_LIMIT} receipt scans left this week")
+# 
+#         uploaded_file = st.file_uploader(L["upload_label"], type=["png", "jpg", "jpeg", "pdf"], key="receipt_uploader")
+#         ocr_date = st.date_input(L["purchase_date"], value=today, key="ocr_date_input")
+# 
+#         if st.button(L["scan_btn"], type="primary"):
+#             if uploaded_file is None:
+#                 st.error("Select a file first.")
+#             elif scans_left <= 0:
+#                 st.error(
+#                     f"You've used all {RECEIPT_SCAN_WEEKLY_LIMIT} receipt scans available this week. "
+#                     "This limit resets on a rolling 7-day basis - try again later."
+#                 )
+#             else:
+#                 record_receipt_scan(st.session_state["user_id"], household_id)
+# 
+#                 with st.status("🧾 Initializing OCR Pipeline...", expanded=True) as status:
+#                     def update_status(msg):
+#                         status.write(msg)
+# 
+#                     file_bytes = uploaded_file.read()
+#                     result = ingestor.parse_preview(
+#                         file_bytes=file_bytes,
+#                         filename=uploaded_file.name,
+#                         household_id=household_id,
+#                         status_callback=update_status
+#                     )
+#                     raw_items = result["items"]
+#                     quality_warnings = result["quality_warnings"]
+# 
+#                     if raw_items:
+#                         for idx, it in enumerate(raw_items):
+#                             it["include"] = True
+#                             it["idx"] = idx
+#                             if "units" not in it:
+#                                 it["units"] = 1
+#                                 
+#                         st.session_state["staged_receipt_items"] = raw_items
+#                         st.session_state["staged_purchase_date"] = ocr_date.strftime("%Y-%m-%d")
+#                         st.session_state["staged_file_bytes"] = file_bytes
+#                         st.session_state["staged_filename"] = uploaded_file.name
+#                         
+#                         status.update(label="✅ Ingestion Complete!", state="complete", expanded=False)
+#                         if quality_warnings:
+#                             st.warning("Some pages were too blurry/dark to read and were skipped - see details above. Consider re-scanning just those pages.")
+#                         st.rerun()
+#                     elif quality_warnings:
+#                         status.update(label="⚠️ Image too unclear to read", state="error", expanded=True)
+#                         st.warning("This photo is too blurry, dark, or low-resolution to read reliably. Please retake it in better lighting, hold the phone steadier, and make sure the receipt fills the frame, then re-upload.")
+#                     else:
+#                         status.update(label="⚠️ No items detected", state="error", expanded=True)
+#                         st.warning("No food items detected.")
+# 
+# else:
+#     with st.sidebar.expander("Paste Grocery Items", expanded=True):
+#         pasted_text = st.text_area("Paste items (one per line):", placeholder="חלב 3%\nביצים 18 יח'\nנקניקיות עוף\nצ'יפס קפוא 2 ק\"ג\nפיתות", height=140)
+#         paste_date = st.date_input("Purchase Date", value=today, key="paste_date_input")
+# 
+#         if st.button("⚡ Ingest Pasted Items", type="primary"):
+#             if pasted_text.strip():
+#                 with st.spinner("Structuring items with GPT-4o..."):
+#                     raw_items = ingestor.parse_raw_text(pasted_text, household_id)
+#                     if raw_items:
+#                         for idx, it in enumerate(raw_items):
+#                             it["include"] = True
+#                             it["idx"] = idx
+#                             if "units" not in it:
+#                                 it["units"] = 1
+#                         st.session_state["staged_receipt_items"] = raw_items
+#                         st.session_state["staged_purchase_date"] = paste_date.strftime("%Y-%m-%d")
+#                         st.session_state["staged_file_bytes"] = None
+#                         st.session_state["staged_filename"] = ""
+#                         st.rerun()
+#             else:
+#                 st.error("Paste some items first.")
+# 
+# # --- SIDE-BY-SIDE VERIFICATION WORKSPACE ---
+# if st.session_state["staged_receipt_items"]:
+#     st.markdown("---")
+#     st.subheader("🧾 Receipt Review & Verification Workspace")
+#     st.caption("Verify extracted items and quantities before committing them to the household inventory.")
+# 
+#     col_view_doc, col_view_table = st.columns([1, 1])
+# 
+#     with col_view_doc:
+#         st.markdown("**Original Receipt Document:**")
+#         file_bytes = st.session_state.get("staged_file_bytes")
+#         filename = st.session_state.get("staged_filename", "").lower()
+# 
+#         if file_bytes:
+#             if filename.endswith(".pdf"):
+#                 try:
+#                     pdf = pdfium.PdfDocument(file_bytes)
+#                     for p_idx, page in enumerate(pdf):
+#                         st.image(
+#                             page.render(scale=1.5).to_pil(),
+#                             caption=f"Receipt Page {p_idx + 1}",
+#                             use_container_width=True
+#                         )
+#                 except Exception as e:
+#                     st.error(f"Error rendering PDF preview: {e}")
+#             else:
+#                 st.image(file_bytes, caption="Uploaded Image", use_container_width=True)
+#         else:
+#             st.info("Pasted items mode (no document file uploaded).")
+# 
+#     with col_view_table:
+#         st.markdown("**Detected Grocery Items:**")
+#         staged = st.session_state["staged_receipt_items"]
+#         edited_df = st.data_editor(
+#             pd.DataFrame(staged)[["include", "item_name_en", "item_name_he", "category", "units"]],
+#             column_config={
+#                 "include": st.column_config.CheckboxColumn("Keep?", default=True),
+#                 "item_name_en": st.column_config.TextColumn("English Name"),
+#                 "item_name_he": st.column_config.TextColumn("Hebrew Name"),
+#                 "category": st.column_config.SelectboxColumn("Category", options=[c["en"] for c in categories_raw]),
+#                 "units": st.column_config.NumberColumn("Qty", min_value=1, step=1, default=1)
+#             },
+#             hide_index=True,
+#             use_container_width=True,
+#             key="staged_editor_sidebyside"
+#         )
+# 
+#         btn_c1, btn_c2 = st.columns([1, 1])
+#         with btn_c1:
+#             if st.button("✅ Commit Items to Pantry", type="primary"):
+#                 conn = get_connection()
+#                 try:
+#                     for _, row in edited_df.iterrows():
+#                         if row["include"]:
+#                             c = conn.cursor()
+#                             c.execute(
+#                                 "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
+#                                 (household_id, row["item_name_en"], row["item_name_he"], row["category"], int(row["units"]), st.session_state["staged_purchase_date"])
+#                             )
+#                     conn.commit()
+#                 finally:
+#                     conn.close()
+#                 st.session_state["staged_receipt_items"] = None
+#                 st.session_state["staged_file_bytes"] = None
+#                 st.session_state["staged_filename"] = ""
+#                 st.success("All verified items added to pantry!")
+#                 st.rerun()
+# 
+#         with btn_c2:
+#             if st.button("❌ Discard Scan"):
+#                 st.session_state["staged_receipt_items"] = None
+#                 st.session_state["staged_file_bytes"] = None
+#                 st.session_state["staged_filename"] = ""
+#                 st.rerun()
+#     st.markdown("---")
