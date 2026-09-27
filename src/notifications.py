@@ -68,7 +68,6 @@ def process_all_daily_alerts(db, engine):
     conn = db.get_connection()
     c = conn.cursor()
     
-    # 1. Use LEFT JOIN and COALESCE so no user is dropped
     c.execute("""
         SELECT 
             COALESCE(u.email, u.username) AS recipient_email,
@@ -80,7 +79,6 @@ def process_all_daily_alerts(db, engine):
            OR (u.username LIKE '%@%')
     """)
     users = [dict(r) for r in c.fetchall()]
-    print(f"DEBUG: Found {len(users)} candidate users.")
     
     today = date.today()
     emails_sent = 0
@@ -89,18 +87,16 @@ def process_all_daily_alerts(db, engine):
         target_email = user["recipient_email"].strip()
         h_id = user["household_id"]
         
-        # If household_id is NULL, query all items or skip
-        if h_id is None:
-            c.execute("SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda FROM inventory")
-        else:
+        if h_id is not None:
             c.execute("""
                 SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda 
                 FROM inventory 
                 WHERE household_id = ?
             """, (h_id,))
+        else:
+            c.execute("SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda FROM inventory")
             
         items = [dict(r) for r in c.fetchall()]
-        print(f"DEBUG: Found {len(items)} items for {target_email} (household: {user['household_name']}).")
         
         high_risk_items = []
         for it in items:
@@ -109,13 +105,11 @@ def process_all_daily_alerts(db, engine):
             units_qty = max(1, it["units"] or 1)
             prob = engine.compute_depletion_probability(it["category"], days_el, it["user_lambda"], units_qty)
             
-            print(f"DEBUG: {it['item_name_en']} -> days={days_el}, prob={prob:.2f}")
             if prob >= 0.65:
                 name = it["item_name_he"] if it["item_name_he"] else it["item_name_en"]
                 high_risk_items.append({'name': name, 'risk': prob, 'days': days_el})
         
         if high_risk_items:
-            print(f"DEBUG: Sending alert to {target_email} with {len(high_risk_items)} high risk items.")
             if send_daily_alert(target_email, user["household_name"], high_risk_items):
                 emails_sent += 1
                 

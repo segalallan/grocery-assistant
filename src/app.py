@@ -26,15 +26,35 @@ st.set_page_config(page_title="Smart Pantry Assistant", layout="wide")
 # ==========================================
 # 1. THE HIDDEN WEBHOOK ENDPOINT (MUST RUN FIRST)
 # ==========================================
-if st.query_params.get("trigger_daily_alerts") == "TRUE":
+trigger = st.query_params.get("trigger_daily_alerts")
+cron_secret = st.secrets.get("CRON_SECRET")
+
+if trigger == "TRUE":
     secret_key = st.query_params.get("secret")
-    if secret_key == st.secrets.get("CRON_SECRET"):
+    if cron_secret and secret_key and secret_key == cron_secret:
+        try:
+            from src.notifications import process_all_daily_alerts
+        except ImportError:
+            from notifications import process_all_daily_alerts
+
         db_inst = PantryDatabase("pantry_v1.db")
         eng_inst = PantryDepletionEngine()
 
-        result = process_all_daily_alerts(db_inst, eng_inst)
+        # Direct diagnostic query to inspect live database state
+        conn = db_inst.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT id, username, email, household_id FROM users")
+        user_rows = [dict(r) for r in c.fetchall()]
+        
+        c.execute("SELECT id, item_name_en, household_id, purchase_date, category FROM inventory")
+        inv_rows = [dict(r) for r in c.fetchall()]
+        conn.close()
 
-        st.success(f"Daily alerts triggered: {result}")
+        st.write(f"🔍 **Diagnostics:** Found {len(user_rows)} users and {len(inv_rows)} inventory items in `pantry_v1.db`.")
+        st.json({"users": user_rows, "sample_inventory": inv_rows[:5]})
+
+        result_msg = process_all_daily_alerts(db_inst, eng_inst)
+        st.success(f"Daily alerts triggered: {result_msg}")
         st.stop()
     else:
         st.error("Unauthorized webhook call.")
