@@ -7,15 +7,15 @@ from datetime import datetime, date
 def send_daily_alert(recipient_email, household_name, high_risk_items):
     """Connects to Gmail securely and sends an HTML restock alert."""
     if not high_risk_items or not recipient_email:
-        return False
+        return False, "Missing items or recipient email"
         
     try:
-        # We now pull the secrets by their variable names, not their values
         sender_email = st.secrets["EMAIL_SENDER"]
         app_password = st.secrets["EMAIL_PASSWORD"]
-    except KeyError:
-        print("CRITICAL: Streamlit secrets for GMAIL are missing. Email aborted.")
-        return False
+    except KeyError as ke:
+        err = f"Streamlit Secrets Key Error: Missing {ke}"
+        print(err)
+        return False, err
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Pantry Alert: Restock required for {household_name}"
@@ -49,7 +49,6 @@ def send_daily_alert(recipient_email, household_name, high_risk_items):
         <p style="margin-top: 20px;">Time to add these to your shopping list!</p>
     </div>
     """
-
     msg.attach(MIMEText(html_content, "html"))
 
     try:
@@ -57,10 +56,69 @@ def send_daily_alert(recipient_email, household_name, high_risk_items):
             server.login(sender_email, app_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
         print(f"Alert sent successfully to {recipient_email}")
-        return True
+        return True, "Success"
     except Exception as e:
-        print(f"Failed to send email to {recipient_email}: {e}")
-        return False
+        err = f"SMTP Transmission Failed: {e}"
+        print(err)
+        return False, err
+
+
+def process_all_daily_alerts(db, engine):
+    """Scans the database headlessly and passes data to your HTML email sender."""
+    conn = db.get_connection()
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT 
+            COALESCE(u.email, u.username) AS recipient_email,
+            u.household_id, 
+            COALESCE(h.name, 'Your Household') AS household_name 
+        FROM users u
+        LEFT JOIN households h ON u.household_id = h.id
+        WHERE (u.email IS NOT NULL AND u.email != '') 
+           OR (u.username LIKE '%@%')
+    """)
+    users = [dict(r) for r in c.fetchall()]
+    
+    today = date.today()
+    emails_sent = 0
+    status_reports = []
+    
+    for user in users:
+        target_email = user["recipient_email"].strip()
+        h_id = user["household_id"]
+        
+        if h_id is not None:
+            c.execute("""
+                SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda 
+                FROM inventory 
+                WHERE household_id = ?
+            """, (h_id,))
+        else:
+            c.execute("SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda FROM inventory")
+            
+        items = [dict(r) for r in c.fetchall()]
+        high_risk_items = []
+        for it in items:
+            p_date = datetime.strptime(it["purchase_date"], "%Y-%m-%d").date()
+            days_el = (today - p_date).days
+            units_qty = max(1, it["units"] or 1)
+            prob = engine.compute_depletion_probability(it["category"], days_el, it["user_lambda"], units_qty)
+            
+            if prob >= 0.65:
+                name = it["item_name_he"] if it["item_name_he"] else it["item_name_en"]
+                high_risk_items.append({'name': name, 'risk': prob, 'days': days_el})
+        
+        if high_risk_items:
+            success, reason = send_daily_alert(target_email, user["household_name"], high_risk_items)
+            if success:
+                emails_sent += 1
+                status_reports.append(f"Sent to {target_email}")
+            else:
+                status_reports.append(f"Failed for {target_email} ({reason})")
+                
+    conn.close()
+    return f"Sent {emails_sent} alerts. Details: {', '.join(status_reports)}"
 
 
 def process_all_daily_alerts(db, engine):
