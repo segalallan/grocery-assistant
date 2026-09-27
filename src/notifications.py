@@ -10,9 +10,12 @@ def send_daily_alert(recipient_email, household_name, high_risk_items):
         return False, "Missing items or recipient email"
         
     try:
-        sender_email = st.secrets["EMAIL_SENDER"]
-        app_password = st.secrets["EMAIL_PASSWORD"]
-    except KeyError as ke:
+        sender_email = st.secrets["EMAIL_SENDER"] or st.secrets["GMAIL_USER"]
+        app_password = st.secrets["EMAIL_PASSWORD"] or st.secrets["GMAIL_APP_PASSWORD"]
+
+        if not sender_email or not app_password:
+            raise KeyError ("Neither GMAIL_USER nor EMAIL_SENDER / passwords were found in st.secrets. ")
+    except Exception as ke:
         err = f"Streamlit Secrets Key Error: Missing {ke}"
         print(err)
         return False, err
