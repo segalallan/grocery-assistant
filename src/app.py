@@ -32,29 +32,31 @@ cron_secret = st.secrets.get("CRON_SECRET")
 if trigger == "TRUE":
     secret_key = st.query_params.get("secret")
     if cron_secret and secret_key and secret_key == cron_secret:
+        import smtplib
+        from notifications import process_all_daily_alerts
+        from database import PantryDatabase
+        from engine import PantryDepletionEngine
+
+        user_val = st.secrets.get("GMAIL_USER") or st.secrets.get("EMAIL_SENDER")
+        pass_val = st.secrets.get("GMAIL_PASSWORD") or st.secrets.get("GMAIL_APP_PASSWORD") or st.secrets.get("EMAIL_PASSWORD")
+
+        st.write(f"🔑 **Resolved Sender Account:** `{user_val}`")
+        st.write(f"🔑 **Password Detected:** `{'Yes (length ' + str(len(pass_val)) + ')' if pass_val else 'NO / NONE'}`")
+
+        # Live SMTP authentication test
         try:
-            from src.notifications import process_all_daily_alerts
-        except ImportError:
-            from notifications import process_all_daily_alerts
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as test_server:
+                test_server.login(user_val, pass_val)
+            st.success("✅ SMTP Authentication Succeeded with Google!")
+        except Exception as auth_err:
+            st.error(f"❌ SMTP Authentication Failed: {auth_err}")
+            st.stop()
 
         db_inst = PantryDatabase("pantry_v1.db")
         eng_inst = PantryDepletionEngine()
-
-        # Direct diagnostic query to inspect live database state
-        conn = db_inst.get_connection()
-        c = conn.cursor()
-        c.execute("SELECT id, username, email, household_id FROM users")
-        user_rows = [dict(r) for r in c.fetchall()]
-        
-        c.execute("SELECT id, item_name_en, household_id, purchase_date, category FROM inventory")
-        inv_rows = [dict(r) for r in c.fetchall()]
-        conn.close()
-
-        st.write(f"🔍 **Diagnostics:** Found {len(user_rows)} users and {len(inv_rows)} inventory items in `pantry_v1.db`.")
-        st.json({"users": user_rows, "sample_inventory": inv_rows[:5]})
-
         result_msg = process_all_daily_alerts(db_inst, eng_inst)
-        st.success(f"Daily alerts triggered: {result_msg}")
+
+        st.info(f"Scan Result: {result_msg}")
         st.stop()
     else:
         st.error("Unauthorized webhook call.")
