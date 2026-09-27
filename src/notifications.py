@@ -56,8 +56,12 @@ def send_daily_alert(recipient_email, household_name, high_risk_items):
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.set_debuglevel(1)  # Prints raw SMTP conversation to Streamlit Cloud logs
             server.login(sender_email, app_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
+            refused = server.sendmail(sender_email, recipient_email, msg.as_string())
+            if refused:
+                print(f"SMTP Recipient Refused: {refused}")
+                return False, f"Recipient refused: {refused}"
         print(f"Alert sent successfully to {recipient_email}")
         return True, "Success"
     except Exception as e:
