@@ -40,15 +40,17 @@ population prior*, so a new item starts sensible and quickly becomes yours.
 **Still have it** never moves the purchase date. It stores `confirmed_until`, and the risk
 becomes conditional: P(gone by today | was there on the confirmed date).
 
+## Database
+
+* Local: a SQLite file (`pantry_v1.db` in the project folder), no setup.
+* Production: Postgres. Set the `DATABASE_URL` secret and the app uses it automatically.
+  On the first start against an empty Postgres, it copies in any existing `pantry_v1.db`.
+  Manual copy: `DATABASE_URL=... python src/jobs/import_sqlite.py path/to/pantry_v1.db`
+* Tests run on SQLite by default. Set `TEST_DATABASE_URL` to a throwaway Postgres to run
+  them there too (they drop all tables in it).
+
 ## Daily alerts
 
-Streamlit can't be triggered by a plain HTTP request (the script only runs for a browser
-session), so alerts run as a separate job:
-
-```bash
-EMAIL_SENDER=... EMAIL_PASSWORD=... PANTRY_DB_PATH=/path/to/pantry_v1.db python src/jobs/send_alerts.py
-```
-
-The job must reach the same database as the app. With SQLite that means running it on the same
-machine. On Streamlit Community Cloud, where the disk is wiped on restart, move to a hosted
-Postgres first; then a GitHub Actions cron can run the job.
+`.github/workflows/daily_alerts.yml` runs `src/jobs/send_alerts.py` every morning. It needs
+three GitHub repository secrets: `DATABASE_URL`, `EMAIL_SENDER`, `EMAIL_PASSWORD`.
+Run it manually from the Actions tab; the manual run defaults to a dry run.

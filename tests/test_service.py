@@ -3,7 +3,6 @@ from datetime import date, timedelta
 import pytest
 
 import pantry_service
-from db import Database
 from engine import PantryDepletionEngine
 from pantry_service import PantryService
 
@@ -11,9 +10,9 @@ TODAY = date(2026, 10, 13)
 
 
 @pytest.fixture
-def svc(tmp_path, monkeypatch):
+def svc(backend, monkeypatch):
     monkeypatch.setattr(pantry_service, "app_today", lambda: TODAY)
-    db = Database(str(tmp_path / "test.db"))
+    db = backend()
     ok, err = db.create_user("a@b.com", "pw", "A", "B", household_name="Home")
     assert ok, err
     return PantryService(db, PantryDepletionEngine())

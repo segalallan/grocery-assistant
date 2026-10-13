@@ -3,6 +3,8 @@
 This file only renders and routes. All data changes go through PantryService,
 so every way of adding or using up an item feeds the learning model.
 """
+import logging
+import os
 import re
 from datetime import timedelta
 
@@ -10,7 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from config import today as app_today
+from config import DB_PATH, today as app_today
 from db import Database
 from engine import PantryDepletionEngine
 from i18n import make_translator
@@ -24,6 +26,7 @@ except ImportError:
     HAS_SORTABLES = False
 
 st.set_page_config(page_title="Smart Pantry Assistant", page_icon="🛒", layout="wide")
+log = logging.getLogger("smart_pantry")
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -33,7 +36,15 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # ==========================================================================
 @st.cache_resource
 def get_service() -> PantryService:
-    return PantryService(Database(), PantryDepletionEngine())
+    db = Database()  # Postgres if the DATABASE_URL secret is set, else local SQLite
+    # First start on Postgres: carry over the household data from the old SQLite file, if it's still here.
+    if db.is_postgres and os.path.exists(DB_PATH) and db.is_empty():
+        try:
+            counts = db.import_from_sqlite(DB_PATH)
+            log.warning("Imported existing SQLite data into Postgres: %s", counts)
+        except Exception:
+            log.exception("SQLite -> Postgres import failed; starting with an empty database")
+    return PantryService(db, PantryDepletionEngine())
 
 
 @st.cache_resource

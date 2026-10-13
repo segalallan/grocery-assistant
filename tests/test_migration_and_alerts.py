@@ -62,14 +62,14 @@ class FakeSMTP:
     def quit(self): pass
 
 
-def test_alerts_send_once_and_escape_html(tmp_path, monkeypatch):
+def test_alerts_send_once_and_escape_html(backend, monkeypatch):
     monkeypatch.setattr(pantry_service, "app_today", lambda: TODAY)
     monkeypatch.setattr(notifications.smtplib, "SMTP_SSL", FakeSMTP)
     monkeypatch.setenv("EMAIL_SENDER", "bot@x.com")
     monkeypatch.setenv("EMAIL_PASSWORD", "secret")
     FakeSMTP.sent = []
 
-    db = Database(str(tmp_path / "a.db"))
+    db = backend()
     db.create_user("a@b.com", "pw", "A", "B", household_name="Home")
     with db.connect() as c:
         code = c.execute("SELECT household_code FROM households").fetchone()[0]
@@ -89,3 +89,38 @@ def test_alerts_send_once_and_escape_html(tmp_path, monkeypatch):
     item = svc.get_pantry(hh)[0] if svc.get_pantry(hh)[0]["name_en"].startswith("<") else svc.get_pantry(hh)[1]
     svc.mark_still_going(hh, [item["id"]], TODAY)
     assert svc.get_pantry(hh)  # still there; stamp cleared, will alert again once risk climbs
+
+
+@pytest.mark.skipif(not ORIGINAL.exists(), reason="original v1 database.py not available")
+def test_import_v1_sqlite_into_current_backend(backend, tmp_path, monkeypatch):
+    """The first-start copy: an old v1 SQLite file → the new database, ids and logins preserved."""
+    monkeypatch.setattr(pantry_service, "app_today", lambda: TODAY)
+    legacy_dir = tmp_path / "legacy2"
+    legacy_dir.mkdir()
+    shutil.copy(ORIGINAL, legacy_dir / "legacy_database2.py")
+    sys.path.insert(0, str(legacy_dir))
+    try:
+        from legacy_database2 import PantryDatabase
+        old_path = str(tmp_path / "old_v1.db")
+        PantryDatabase(old_path).create_user("old@b.com", "pw", "Old", "User", household_name="Old Home")
+    finally:
+        sys.path.remove(str(legacy_dir))
+    conn = sqlite3.connect(old_path)
+    hh = conn.execute("SELECT id FROM households").fetchone()[0]
+    conn.execute("INSERT INTO inventory (household_id, category, item_name_en, item_name_he, units, purchase_date, user_lambda)"
+                 " VALUES (?, 'Dairy & Eggs', 'Milk', 'חלב', 1, ?, 12.0)", (hh, str(TODAY - timedelta(days=5))))
+    conn.commit(); conn.close()
+
+    target = backend()
+    if backend.name == "sqlite":  # target must be a different, empty file
+        target = Database(db_path=str(tmp_path / "fresh_target.db"))
+    counts = target.import_from_sqlite(old_path)
+    assert counts["users"] == 1 and counts["inventory"] == 1 and counts["household_categories"] == 8
+    assert target.authenticate("old@b.com", "pw")["household_name"] == "Old Home"
+
+    svc = PantryService(target, PantryDepletionEngine())
+    assert svc.get_pantry(hh)[0]["item_key"] == "milk"
+    ok, _ = target.create_user("new@b.com", "pw", "N", "U", household_name="New")  # ids don't collide
+    assert ok
+    with pytest.raises(RuntimeError):
+        target.import_from_sqlite(old_path)  # never imports over existing data

@@ -9,13 +9,9 @@ APP = str(Path(__file__).resolve().parent.parent / "src" / "app.py")
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
-    monkeypatch.setenv("PANTRY_DB_PATH", str(tmp_path / "app.db"))
+def env(backend, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    import config
-    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "app.db"))
-    import db as db_mod
-    database = db_mod.Database(str(tmp_path / "app.db"))
+    database = backend()
     ok, _ = database.create_user("a@b.com", "password1", "Avi", "S", household_name="Home")
     assert ok
     return database

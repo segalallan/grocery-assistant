@@ -7,7 +7,7 @@ Learning happens in exactly three places:
   * mark_still_going – records a censoring point (confirmed_until); purchase_date is NOT touched
 """
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from config import DATE_FMT, RESTOCK_THRESHOLD, today as app_today
 from db import Database, normalize_key
@@ -46,7 +46,8 @@ class PantryService:
         return conn.execute(
             """SELECT * FROM inventory
                WHERE household_id = ?
-                 AND (item_key = ? OR (TRIM(COALESCE(?, '')) != '' AND LOWER(item_name_he) = LOWER(TRIM(?))))
+                 AND (item_key = ? OR (TRIM(COALESCE(CAST(? AS TEXT), '')) != ''
+                                       AND LOWER(item_name_he) = LOWER(TRIM(CAST(? AS TEXT)))))
                ORDER BY purchase_date DESC, id DESC LIMIT 1""",
             (household_id, key, name_he, name_he),
         ).fetchone()
@@ -290,13 +291,13 @@ class PantryService:
         }
 
     def recent_purchases(self, household_id, days=60, as_of=None) -> list[dict]:
-        as_of = _to_date(as_of or app_today())
+        cutoff = _to_date(as_of or app_today()) - timedelta(days=int(days))
         with self.db.connect() as conn:
             rows = conn.execute(
                 """SELECT purchase_date, item_name_en, item_name_he, category, units, recorded_by
-                   FROM purchases WHERE household_id = ? AND purchase_date >= date(?, ?)
+                   FROM purchases WHERE household_id = ? AND purchase_date >= ?
                    ORDER BY purchase_date DESC, id DESC""",
-                (household_id, _s(as_of), f"-{int(days)} days")).fetchall()
+                (household_id, _s(cutoff))).fetchall()
         return [dict(r) for r in rows]
 
     # ======================================================================

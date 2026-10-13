@@ -1,0 +1,31 @@
+name: Daily Pantry Alerts
+
+on:
+  schedule:
+    # 05:07 UTC = 08:07 Israel summer time / 07:07 winter time.
+    # (Off the top of the hour, when GitHub's scheduler is busiest.)
+    - cron: '7 5 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print who would be emailed"
+        type: boolean
+        default: true
+
+jobs:
+  send-alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Send restock alerts
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python src/jobs/send_alerts.py --require-postgres ${{ inputs.dry_run && '--dry-run' || '' }}
