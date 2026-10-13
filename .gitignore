@@ -1,17 +1,18 @@
+# Secrets and local Streamlit config
 .streamlit/
-__pycache__/
-venv/
-.venv/
-pantry.db
-pantry.db-wal
-pantry.db-shm
-data/
-*.csv
-.streamlit/secrets.toml
+
+# Databases
 *.db
 *.db-wal
 *.db-shm
+
+# Data folder: ignore everything except the priors file the app needs
+data/*
+!data/category_priors.json
+*.csv
+
+# Python / tooling
 venv/
+.venv/
 __pycache__/
 .pytest_cache/
-data/*.csv

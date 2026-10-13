@@ -1,0 +1,11 @@
+{
+  "Dairy & Eggs":   {"median_days": 8.0,  "rho": 1.35},
+  "Bakery & Bread": {"median_days": 4.0,  "rho": 1.45},
+  "Produce":        {"median_days": 6.0,  "rho": 1.35},
+  "Meat & Poultry": {"median_days": 5.0,  "rho": 1.50},
+  "Pantry Staples": {"median_days": 40.0, "rho": 1.25},
+  "Frozen Foods":   {"median_days": 30.0, "rho": 1.25},
+  "Beverages":      {"median_days": 10.0, "rho": 1.30},
+  "Snacks":         {"median_days": 10.0, "rho": 1.30},
+  "Cleaning":       {"median_days": 45.0, "rho": 1.25}
+}
