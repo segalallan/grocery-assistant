@@ -2,18 +2,36 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    # Runs every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
-    - cron: '0 */6 * * *'
-  workflow_dispatch: # Allows manual trigger from the GitHub Actions UI
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:
 
 jobs:
-  ping:
+  visit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Ping Streamlit Health Endpoint
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install headless browser
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://grocery-assistant.streamlit.app/_stcore/health")
-          echo "Streamlit health status code: $STATUS"
-          if [ "$STATUS" -ne 200 ]; then
-            echo "Warning: Expected 200 OK, got $STATUS"
-          fi
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: Open the app like a real visitor
+        shell: python
+        run: |
+          from playwright.sync_api import sync_playwright
+          URL = "https://grocery-assistant.streamlit.app/"
+          with sync_playwright() as p:
+              page = p.chromium.launch().new_page()
+              page.goto(URL, timeout=90_000)
+              page.wait_for_timeout(5_000)
+              wake = page.get_by_role("button", name="Yes, get this app back up!")
+              if wake.count():
+                  print("App was asleep - waking it")
+                  wake.click()
+                  page.wait_for_timeout(60_000)
+              else:
+                  print("App is awake")
+                  page.wait_for_timeout(15_000)
+              print("Final page title:", page.title())
