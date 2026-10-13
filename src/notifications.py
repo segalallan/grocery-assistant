@@ -84,7 +84,7 @@ def process_all_daily_alerts(service, dry_run: bool = False) -> dict:
             if not fresh:
                 continue
             summary["households"] += 1
-            items = [{"name": i["name_he"] or i["name_en"], "risk": i["prob_depleted"], "days": i["days_elapsed"]}
+            items = [{"name": i["name_en"] or i["name_he"], "risk": i["prob_depleted"], "days": i["days_elapsed"]}
                      for i in fresh]
             if dry_run:
                 log.info("[dry run] %s: %s", hh["name"], [i["name"] for i in items])
