@@ -127,7 +127,10 @@ def render_auth_view():
                     st.error(tr("err_pw_short"))
                 else:
                     ok, err = db.create_user(email, password, first, last, house_name, join_code or None)
-                    st.success(tr("signup_ok")) if ok else st.error(err)
+                    if ok:
+                        st.success(tr("signup_ok"))
+                    else:
+                        st.error(err)
 
 
 if not st.session_state.get("authenticated"):
