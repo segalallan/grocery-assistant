@@ -23,6 +23,18 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
+
+      - name: Check secrets are visible
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: |
+          for v in DATABASE_URL EMAIL_SENDER EMAIL_PASSWORD; do
+            val="${!v}"
+            if [ -z "$val" ]; then echo "$v: MISSING"; else echo "$v: set (length ${#val})"; fi
+          done
+
       - name: Send restock alerts
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
