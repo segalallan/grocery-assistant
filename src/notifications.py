@@ -1,129 +1,116 @@
+"""Daily restock emails. Runs headless (no Streamlit needed) — see jobs/send_alerts.py.
+
+Each stock row is emailed about once: after an alert it's stamped `last_alerted`,
+and that stamp is cleared by "still going" (or replaced by a new purchase row).
+"""
+import html
+import logging
 import smtplib
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import streamlit as st
-from datetime import datetime, date
+from email.mime.text import MIMEText
 
-def send_daily_alert(recipient_email, household_name, high_risk_items):
-    """Connects to Gmail securely and sends an HTML restock alert."""
-    if not high_risk_items or not recipient_email:
-        return False, "Missing items or recipient email"
-        
-    try:
-        # FIX: Use .get() to prevent KeyErrors
-        sender_email = st.secrets.get("EMAIL_SENDER") or st.secrets.get("GMAIL_USER")
-        app_password = st.secrets.get("EMAIL_PASSWORD") or st.secrets.get("GMAIL_APP_PASSWORD")
+from config import RESTOCK_THRESHOLD, get_secret
 
-        if not sender_email or not app_password:
-            raise KeyError("Neither GMAIL_USER nor EMAIL_SENDER / passwords were found in st.secrets.")
-    except Exception as ke:
-        err = f"Streamlit Secrets Key Error: Missing {ke}"
-        print(err)
-        return False, err
+log = logging.getLogger(__name__)
 
+
+def _smtp_credentials():
+    sender = get_secret("EMAIL_SENDER", "GMAIL_USER")
+    password = get_secret("EMAIL_PASSWORD", "GMAIL_APP_PASSWORD", "GMAIL_PASSWORD")
+    if not sender or not password:
+        raise RuntimeError("Missing email credentials (EMAIL_SENDER / EMAIL_PASSWORD).")
+    return sender, password
+
+
+def build_alert_html(household_name: str, items: list[dict]) -> str:
+    rows = "".join(
+        f"""<tr>
+              <td style="padding:8px;border:1px solid #ddd;"><b>{html.escape(str(it['name']))}</b></td>
+              <td style="padding:8px;border:1px solid #ddd;color:#d9534f;"><b>{int(it['risk'] * 100)}%</b></td>
+              <td style="padding:8px;border:1px solid #ddd;">{int(it['days'])}</td>
+            </tr>"""
+        for it in items
+    )
+    return f"""
+    <div style="font-family:Arial,sans-serif;color:#333;">
+      <h2 style="color:#1B365D;">Smart Pantry: Restock Alert</h2>
+      <p>These items in <b>{html.escape(household_name)}</b> are probably running out:</p>
+      <table style="width:100%;border-collapse:collapse;margin-top:10px;">
+        <tr style="background:#f4f4f4;text-align:left;">
+          <th style="padding:8px;border:1px solid #ddd;">Item</th>
+          <th style="padding:8px;border:1px solid #ddd;">Chance it's gone</th>
+          <th style="padding:8px;border:1px solid #ddd;">Days since purchase</th>
+        </tr>
+        {rows}
+      </table>
+      <p style="margin-top:20px;">Open the app to add them to your shopping list or mark them as still going.</p>
+    </div>"""
+
+
+def send_alert_email(server, sender, recipient, household_name, items):
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"Pantry Alert: Restock required for {household_name}"
-    msg["From"] = sender_email
-    msg["To"] = recipient_email
+    msg["Subject"] = f"Pantry alert: {len(items)} item(s) running low in {household_name}"
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.attach(MIMEText(build_alert_html(household_name, items), "html", "utf-8"))
+    refused = server.sendmail(sender, [recipient], msg.as_string())
+    if refused:
+        raise RuntimeError(f"Recipient refused: {refused}")
 
-    html_content = f"""
-    <div style="font-family: Arial, sans-serif; color: #333;">
-        <h2 style="color: #1B365D;">Smart Pantry: Daily Restock Alert</h2>
-        <p>The following items in <b>{household_name}</b> have a high risk of being depleted today:</p>
-        <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
-            <tr style="background-color: #f4f4f4; text-align: left;">
-                <th style="padding: 8px; border: 1px solid #ddd;">Item Name</th>
-                <th style="padding: 8px; border: 1px solid #ddd;">Depletion Risk</th>
-                <th style="padding: 8px; border: 1px solid #ddd;">Days Elapsed</th>
-            </tr>
-    """
-    
-    for item in high_risk_items:
-        risk_pct = int(item['risk'] * 100)
-        html_content += f"""
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><b>{item['name']}</b></td>
-                <td style="padding: 8px; border: 1px solid #ddd; color: #d9534f;"><b>{risk_pct}%</b></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{item['days']} days</td>
-            </tr>
-        """
-        
-    html_content += """
-        </table>
-        <p style="margin-top: 20px;">Time to add these to your shopping list!</p>
-    </div>
-    """
-    msg.attach(MIMEText(html_content, "html"))
 
+def process_all_daily_alerts(service, dry_run: bool = False) -> dict:
+    """Emails every member of each household about newly high-risk items.
+
+    Returns a summary dict. With dry_run=True nothing is sent or stamped.
+    """
+    with service.db.connect() as conn:
+        members = [dict(r) for r in conn.execute(
+            """SELECT u.household_id, COALESCE(NULLIF(u.email, ''), u.username) AS email,
+                      COALESCE(h.name, 'Your Household') AS household_name
+               FROM users u JOIN households h ON u.household_id = h.id
+               WHERE COALESCE(NULLIF(u.email, ''), u.username) LIKE '%@%'""")]
+
+    by_household: dict[int, dict] = {}
+    for m in members:
+        hh = by_household.setdefault(m["household_id"], {"name": m["household_name"], "emails": []})
+        hh["emails"].append(m["email"].strip())
+
+    summary = {"households": 0, "emails_sent": 0, "items_alerted": 0, "errors": []}
+    server = None
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.set_debuglevel(1)
-            server.login(sender_email, app_password)
-            refused = server.sendmail(sender_email, recipient_email, msg.as_string())
-            if refused:
-                print(f"SMTP Recipient Refused: {refused}")
-                return False, f"Recipient refused: {refused}"
-        print(f"Alert sent successfully to {recipient_email}")
-        return True, "Success"
-    except Exception as e:
-        err = f"SMTP Transmission Failed: {e}"
-        print(err)
-        return False, err
+        for hh_id, hh in by_household.items():
+            pantry = service.get_pantry(hh_id)
+            fresh = [i for i in service.restock_candidates(pantry, RESTOCK_THRESHOLD) if not i["last_alerted"]]
+            if not fresh:
+                continue
+            summary["households"] += 1
+            items = [{"name": i["name_he"] or i["name_en"], "risk": i["prob_depleted"], "days": i["days_elapsed"]}
+                     for i in fresh]
+            if dry_run:
+                log.info("[dry run] %s: %s", hh["name"], [i["name"] for i in items])
+                continue
 
-def process_all_daily_alerts(db, engine):
-    """Scans the database headlessly and passes data to your HTML email sender."""
-    conn = db.get_connection()
-    c = conn.cursor()
-    
-    c.execute("""
-        SELECT 
-            COALESCE(u.email, u.username) AS recipient_email,
-            u.household_id, 
-            COALESCE(h.name, 'Your Household') AS household_name 
-        FROM users u
-        LEFT JOIN households h ON u.household_id = h.id
-        WHERE (u.email IS NOT NULL AND u.email != '') 
-           OR (u.username LIKE '%@%')
-    """)
-    users = [dict(r) for r in c.fetchall()]
-    
-    today = date.today()
-    emails_sent = 0
-    status_reports = []
-    
-    for user in users:
-        target_email = user["recipient_email"].strip()
-        h_id = user["household_id"]
-        
-        if h_id is not None:
-            c.execute("""
-                SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda 
-                FROM inventory 
-                WHERE household_id = ?
-            """, (h_id,))
-        else:
-            c.execute("SELECT item_name_en, item_name_he, category, purchase_date, units, user_lambda FROM inventory")
-            
-        items = [dict(r) for r in c.fetchall()]
-        high_risk_items = []
-        for it in items:
-            p_date = datetime.strptime(it["purchase_date"], "%Y-%m-%d").date()
-            days_el = (today - p_date).days
-            units_qty = max(1, it["units"] or 1)
-            prob = engine.compute_depletion_probability(it["category"], days_el, it["user_lambda"], units_qty)
-            
-            if prob >= 0.65:
-                name = it["item_name_he"] if it["item_name_he"] else it["item_name_en"]
-                high_risk_items.append({'name': name, 'risk': prob, 'days': days_el})
-        
-        if high_risk_items:
-            success, reason = send_daily_alert(target_email, user["household_name"], high_risk_items)
-            # FIX: Unpack tuple properly so failed tuple evaluates as False
-            if success:
-                emails_sent += 1
-                status_reports.append(f"Sent to {target_email}")
-            else:
-                status_reports.append(f"Failed for {target_email} ({reason})")
-                
-    conn.close()
-    return f"Sent {emails_sent} alerts. Details: {', '.join(status_reports)}"
+            if server is None:
+                sender, password = _smtp_credentials()
+                server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30)
+                server.login(sender, password)
+
+            sent_any = False
+            for email in hh["emails"]:
+                try:
+                    send_alert_email(server, sender, email, hh["name"], items)
+                    summary["emails_sent"] += 1
+                    sent_any = True
+                except Exception as e:
+                    summary["errors"].append(f"{email}: {e}")
+                    log.warning("Alert to %s failed: %s", email, e)
+            if sent_any:
+                service.mark_alerted(hh_id, [i["id"] for i in fresh])
+                summary["items_alerted"] += len(fresh)
+    finally:
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:
+                pass
+    return summary

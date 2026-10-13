@@ -1,11 +1,21 @@
-import streamlit as st
+"""Smart Pantry – Streamlit UI.
+
+This file only renders and routes. All data changes go through PantryService,
+so every way of adding or using up an item feeds the learning model.
+"""
+import re
+from datetime import timedelta
+
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime, date
-import uuid
-import pypdfium2 as pdfium
-import io
+import streamlit as st
+
+from config import today as app_today
+from db import Database
+from engine import PantryDepletionEngine
+from i18n import make_translator
+from pantry_service import PantryService
+from text_parser import TextListParser
 
 try:
     from streamlit_sortables import sort_items
@@ -13,1049 +23,536 @@ try:
 except ImportError:
     HAS_SORTABLES = False
 
-# Fully class-based import
-from database import PantryDatabase
-from engine import PantryDepletionEngine
-from parser import ReceiptIngestor
-from notifications import process_all_daily_alerts
+st.set_page_config(page_title="Smart Pantry Assistant", page_icon="🛒", layout="wide")
 
-RECEIPT_SCAN_WEEKLY_LIMIT = 10
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-st.set_page_config(page_title="Smart Pantry Assistant", layout="wide")
 
-# ==========================================
-# 1. THE HIDDEN WEBHOOK ENDPOINT (MUST RUN FIRST)
-# ==========================================
-trigger = st.query_params.get("trigger_daily_alerts")
-cron_secret = st.secrets.get("CRON_SECRET")
+# ==========================================================================
+# Shared resources (created once per server process, not on every click)
+# ==========================================================================
+@st.cache_resource
+def get_service() -> PantryService:
+    return PantryService(Database(), PantryDepletionEngine())
 
-if trigger == "TRUE":
-    secret_key = st.query_params.get("secret")
-    if cron_secret and secret_key and secret_key == cron_secret:
-        import smtplib
-        from notifications import process_all_daily_alerts
-        from database import PantryDatabase
-        from engine import PantryDepletionEngine
 
-        user_val = st.secrets.get("GMAIL_USER") or st.secrets.get("EMAIL_SENDER")
-        pass_val = st.secrets.get("GMAIL_PASSWORD") or st.secrets.get("GMAIL_APP_PASSWORD") or st.secrets.get("EMAIL_PASSWORD")
+@st.cache_resource
+def get_parser() -> TextListParser:
+    return TextListParser()
 
-        st.write(f"🔑 **Resolved Sender Account:** `{user_val}`")
-        st.write(f"🔑 **Password Detected:** `{'Yes (length ' + str(len(pass_val)) + ')' if pass_val else 'NO / NONE'}`")
 
-        # Live SMTP authentication test
-        try:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as test_server:
-                test_server.login(user_val, pass_val)
-            st.success("✅ SMTP Authentication Succeeded with Google!")
-        except Exception as auth_err:
-            st.error(f"❌ SMTP Authentication Failed: {auth_err}")
-            st.stop()
+svc = get_service()
+db = svc.db
+engine = svc.engine
 
-        db_inst = PantryDatabase("pantry_v1.db")
-        eng_inst = PantryDepletionEngine()
-        result_msg = process_all_daily_alerts(db_inst, eng_inst)
 
-        st.info(f"Scan Result: {result_msg}")
-        st.stop()
-    else:
-        st.error("Unauthorized webhook call.")
-        st.stop()
+def clear_keys(prefix: str):
+    for k in [k for k in st.session_state if str(k).startswith(prefix)]:
+        del st.session_state[k]
 
-# ==========================================
-# 2. INITIALIZATION & STATE
-# ==========================================
-db = PantryDatabase("pantry_v1.db")
-engine = PantryDepletionEngine()
-ingestor = ReceiptIngestor()
 
-def seed_default_categories(h_id):
-    conn = db.get_connection()
-    c = conn.cursor()
-    default_cats = [
-        ("Dairy & Eggs", "מוצרי חלב וביצים"),
-        ("Produce", "פירות וירקות"),
-        ("Meat & Poultry", "בשר ועוף"),
-        ("Pantry Staples", "מזווה בסיסי"),
-        ("Frozen Foods", "קפואים"),
-        ("Beverages", "משקאות"),
-        ("Snacks", "חטיפים"),
-        ("Cleaning", "חומרי ניקוי")
-    ]
-    for en, he in default_cats:
-        try:
-            c.execute("INSERT OR IGNORE INTO household_categories (household_id, name_en, name_he) VALUES (?, ?, ?)", (h_id, en, he))
-        except:
-            pass
-    conn.commit()
-    conn.close()
-
-TRANSLATIONS = {
-    "en": {
-        "title": "🛒 Smart Pantry Assistant",
-        "login_sub": "Login or Join a Household",
-        "tab_login": "🔑 Log In",
-        "tab_signup": "🏠 Sign Up",
-        "username": "Username",
-        "password": "Password",
-        "sign_in_btn": "Sign In",
-        "choose_user": "Choose Username",
-        "your_name": "Your Name",
-        "house_name": "Household Name",
-        "create_acct_btn": "Create Account",
-        "logout_btn": "🚪 Log Out",
-        "tab_pantry": "📦 Shared Pantry",
-        "tab_shopping": "📝 Shopping List",
-        "tab_categories": "🏷️ Category Manager",
-        "tab_curves": "📈 Survival Curves",
-        "sort_pantry_label": "Sort Pantry By:",
-        "sort_category": "Category",
-        "sort_risk": "Depletion Risk (Highest First)",
-        "sort_name": "Item Name (A-Z)",
-        "sort_date": "Purchase Date (Newest First)",
-        "depletion_risk": "Depletion Risk",
-        "household_velocity": "Household Velocity (λ)",
-        "delete_btn": "🗑️",
-        "delete_tooltip": "Delete from database",
-        "manual_add_pantry": "➕ Add Item Manually to Pantry",
-        "manual_add_shop": "➕ Add Item to Shopping List",
-        "item_name_en": "Item Name (English)",
-        "item_name_he": "Item Name (Hebrew / עברית)",
-        "units": "Units / Qty",
-        "purchase_date": "Purchase Date",
-        "save_btn": "Save Item",
-        "update_btn": "Update",
-        "edit_tooltip": "✏️ Edit item",
-        "org_label": "Shopping List Organization:",
-        "org_custom": "Custom Order (Drag & Drop)",
-        "org_category": "By Category",
-        "org_name": "Item Name (A-Z)",
-        "bought_btn": "🛒 Bought",
-        "sidebar_receipt": "📷 Receipt Ingestion",
-        "upload_label": "Upload receipt file (Photo or PDF)",
-        "scan_btn": "Scan & Ingest Receipt",
-        "empty_pantry": "Pantry is empty. Add items manually or scan a receipt!",
-        "empty_list": "Shopping list is clear! 🎉",
-        "drag_drop_caption": "↕️ Drag and drop cards below to set your aisle walking path:",
-        "install_sortables_warning": "To use drag-and-drop reordering, run: `pip install streamlit-sortables`"
-    },
-    "he": {
-        "title": "🛒 עוזר המזווה החכם",
-        "login_sub": "התחברות למערכת",
-        "tab_login": "🔑 התחברות",
-        "tab_signup": "🏠 הרשמה",
-        "username": "שם משתמש",
-        "password": "סיסמה",
-        "sign_in_btn": "התחבר",
-        "choose_user": "בחר שם משתמש",
-        "your_name": "השם שלך",
-        "house_name": "שם משק הבית",
-        "create_acct_btn": "צור חשבון",
-        "logout_btn": "🚪 התנתק",
-        "tab_pantry": "📦 המזווה המשותף",
-        "tab_shopping": "📝 רשימת קניות",
-        "tab_categories": "🏷️ ניהול קטגוריות",
-        "tab_curves": "📈 עקומות הישרדות",
-        "sort_pantry_label": "מיין מזווה לפי:",
-        "sort_category": "קטגוריה",
-        "sort_risk": "סיכון מחסור (מהגבוה לנמוך)",
-        "sort_name": "שם מוצר (א-ת)",
-        "sort_date": "תאריך קנייה (מהחדש לישן)",
-        "depletion_risk": "סיכון שנגמר",
-        "household_velocity": "קצב צריכה ביתי (λ)",
-        "delete_btn": "🗑️",
-        "delete_tooltip": "מחק מהמאגר",
-        "manual_add_pantry": "➕ הוסף פריט ידנית למזווה",
-        "manual_add_shop": "➕ הוסף פריט לרשימת הקניות",
-        "item_name_en": "שם באנגלית",
-        "item_name_he": "שם בעברית",
-        "units": "כמות",
-        "purchase_date": "תאריך קנייה",
-        "save_btn": "שמור פריט",
-        "update_btn": "עדכן",
-        "edit_tooltip": "✏️ ערוך פריט",
-        "org_label": "סדר רשימת הקניות:",
-        "org_custom": "סדר מותאם (גרירה ושחרור)",
-        "org_category": "לפי קטגוריה",
-        "org_name": "שם פריט (א-ת)",
-        "bought_btn": "🛒 נקנה",
-        "sidebar_receipt": "📷 סריקת קבלות",
-        "upload_label": "העלאת קובץ קבלה (תמונה או PDF)",
-        "scan_btn": "סרוק והזן פריטים",
-        "empty_pantry": "המזווה ריק. הוסף פריטים ידנית או סרוק קבלה!",
-        "empty_list": "רשימת הקניות ריקה! 🎉",
-        "drag_drop_caption": "↕️ גרור ושחרר את הכרטיסיות כדי לקבוע את מסלול ההליכה בסופר:",
-        "install_sortables_warning": "כדי להשתמש בגרירה ושחרור, הרץ: `pip install streamlit-sortables`"
-    }
-}
-
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-    st.session_state["user_id"] = None
-    st.session_state["username"] = None
-    st.session_state["display_name"] = None
-    st.session_state["household_id"] = None
-    st.session_state["household_name"] = None
-    st.session_state["household_code"] = None
-    st.session_state["email"] = None
-
-if "lang" not in st.session_state:
-    st.session_state["lang"] = "en"
-
-selected_lang = st.sidebar.selectbox(
-    "🌐 Language / שפה",
-    ["English", "עברית"],
-    index=0 if st.session_state["lang"] == "en" else 1
-)
-st.session_state["lang"] = "en" if selected_lang == "English" else "he"
-L = TRANSLATIONS[st.session_state["lang"]]
+# ==========================================================================
+# Language
+# ==========================================================================
+st.session_state.setdefault("lang", "en")
+lang_choice = st.sidebar.selectbox("🌐 Language / שפה", ["English", "עברית"],
+                                   index=0 if st.session_state["lang"] == "en" else 1)
+st.session_state["lang"] = "en" if lang_choice == "English" else "he"
 is_he = st.session_state["lang"] == "he"
+tr = make_translator(st.session_state["lang"])
+if is_he:
+    st.markdown("<style>.stMainBlockContainer, section[data-testid='stSidebar'] {direction: rtl; text-align: right;}</style>",
+                unsafe_allow_html=True)
+
+
+# ==========================================================================
+# Authentication
+# ==========================================================================
+def login(user: dict):
+    st.session_state.update({
+        "authenticated": True,
+        "user_id": user["id"],
+        "username": user["username"],
+        "display_name": user["display_name"] or user["username"],
+        "household_id": user["household_id"],
+        "household_name": user["household_name"],
+        "household_code": user["household_code"],
+        "email": user["email"],
+    })
+
+
+def logout():
+    for k in list(st.session_state.keys()):
+        if k != "lang":
+            del st.session_state[k]
+
 
 def render_auth_view():
-    st.title(L["title"])
-    st.subheader(L["login_sub"])
-
-    tab_login, tab_signup, tab_reset = st.tabs([L["tab_login"], L["tab_signup"], "🔄 Reset Password"])
+    st.title(tr("title"))
+    st.subheader(tr("login_sub"))
+    tab_login, tab_signup = st.tabs([tr("tab_login"), tr("tab_signup")])
 
     with tab_login:
         with st.form("login_form"):
-            login_email = st.text_input("Email Address").strip().lower()
-            password = st.text_input(L["password"], type="password")
-            if st.form_submit_button(L["sign_in_btn"]):
-                if not login_email or not password:
-                    st.error("Please enter both email and password.")
+            email = st.text_input(tr("email")).strip().lower()
+            password = st.text_input(tr("password"), type="password")
+            if st.form_submit_button(tr("sign_in_btn"), type="primary"):
+                user = db.authenticate(email, password) if email and password else None
+                if user:
+                    login(user)
+                    st.rerun()
                 else:
-                    user = db.verify_user(login_email, password)
-                    if user:
-                        conn = db.get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                            SELECT u.id, u.username, u.display_name, u.household_id, u.email, h.name as household_name, h.household_code
-                            FROM users u
-                            LEFT JOIN households h ON u.household_id = h.id
-                            WHERE u.username = ?
-                        """, (login_email,))
-                        full_user = cursor.fetchone()
-                        conn.close()
-
-                        if full_user:
-                            st.session_state["authenticated"] = True
-                            st.session_state["user_id"] = full_user["id"]
-                            st.session_state["username"] = full_user["username"]
-                            st.session_state["display_name"] = full_user["display_name"] or full_user["username"]
-                            st.session_state["household_id"] = full_user["household_id"]
-                            st.session_state["household_name"] = full_user["household_name"]
-                            st.session_state["household_code"] = full_user["household_code"]
-                            st.session_state["email"] = full_user["email"]
-                            st.rerun()
-                    else:
-                        st.error("Invalid credentials.")
+                    st.error(tr("err_creds"))
+        st.caption(tr("forgot_pw"))
 
     with tab_signup:
         with st.form("signup_form"):
-            first_name = st.text_input("First Name").strip()
-            last_name = st.text_input("Last Name").strip()
-            new_email = st.text_input("Email Address").strip().lower()
-            new_password = st.text_input(L["password"], type="password")
-            house_name = st.text_input("Household Name", placeholder="e.g. Herzliya Apartment")
+            c1, c2 = st.columns(2)
+            first = c1.text_input(tr("first_name")).strip()
+            last = c2.text_input(tr("last_name")).strip()
+            email = st.text_input(tr("email"), key="su_email").strip().lower()
+            password = st.text_input(tr("password"), type="password", key="su_pw")
+            st.markdown(f"**{tr('household_setup')}**")
+            join_code = st.text_input(tr("join_code")).strip()
+            house_name = st.text_input(tr("new_house_name"), placeholder="e.g. Herzliya Apartment").strip()
 
-            if st.form_submit_button(L["create_acct_btn"]):
-                if not first_name or not last_name or not new_password or not new_email or not house_name:
-                    st.error("Please fill in all fields.")
-                elif "@" not in new_email or "." not in new_email:
-                    st.error("Please enter a valid email address.")
+            if st.form_submit_button(tr("create_acct_btn"), type="primary"):
+                if not (first and last and email and password):
+                    st.error(tr("err_fill_all"))
+                elif not join_code and not house_name:
+                    st.error(tr("err_need_house"))
+                elif not EMAIL_RE.match(email):
+                    st.error(tr("err_email"))
+                elif len(password) < 8:
+                    st.error(tr("err_pw_short"))
                 else:
-                    # Pass the first and last name to the DB to create the display name
-                    success = db.create_user(new_email, new_password, first_name, last_name, house_name)
-                    if success:
-                        st.success("Account created successfully! Please log in above.")
-                    else:
-                        st.error("An account with this email already exists.")
+                    ok, err = db.create_user(email, password, first, last, house_name, join_code or None)
+                    st.success(tr("signup_ok")) if ok else st.error(err)
 
-    with tab_reset:
-        with st.form("reset_form"):
-            st.write("Forgot your password? Enter your email to set a new one.")
-            reset_email = st.text_input("Account Email").strip().lower()
-            new_pass = st.text_input("New Password", type="password")
-            if st.form_submit_button("Change Password"):
-                if reset_email and new_pass:
-                    if db.change_password(reset_email, new_pass):
-                        st.success("Password updated successfully! You can now log in.")
-                    else:
-                        st.error("Email not found in our system.")
-                else:
-                    st.error("Please fill in both fields.")
 
-# ==========================================
-# 3. AUTHENTICATION GATES
-# ==========================================
-if not st.session_state["authenticated"]:
+if not st.session_state.get("authenticated"):
     render_auth_view()
     st.stop()
 
-@st.dialog("Missing Account Details")
-def email_intercept_dialog(user_id):
-    st.warning("Welcome back! Before we continue, we're adding daily restock alerts. Please link a valid email address to your account.")
-    new_email = st.text_input("Email Address")
-    if st.button("Save Email"):
-        if "@" in new_email and "." in new_email:
-            db.update_user_email(user_id, new_email)
-            st.session_state["email"] = new_email
-            st.rerun()
-        else:
-            st.error("Please enter a valid email format.")
-
-if not st.session_state.get("email"):
-    email_intercept_dialog(st.session_state["user_id"])
-    st.stop()
-
-# ==========================================
-# 4. APP DASHBOARD LOGIC
-# ==========================================
+# ==========================================================================
+# Session context
+# ==========================================================================
 household_id = st.session_state["household_id"]
 display_name = st.session_state["display_name"]
 household_name = st.session_state["household_name"]
-household_code = st.session_state["household_code"]
-today_str = date.today().strftime("%Y-%m-%d")
-today = date.today()
+today = app_today()
 
-head_c1, head_c2 = st.columns([4, 1])
-with head_c1:
-    st.title(L["title"])
-    st.markdown(f"👤 **{display_name}** | 🏠 **{household_name}** (`{household_code}`)")
-with head_c2:
-    if st.button(L["logout_btn"]):
-        st.session_state["authenticated"] = False
+head_l, head_r = st.columns([4, 1.4])
+with head_l:
+    st.title(tr("title"))
+    st.markdown(f"👤 **{display_name}** · 🏠 **{household_name}** · {tr('invite')} `{st.session_state['household_code']}`")
+with head_r:
+    with st.popover(tr("account"), width="stretch"):
+        with st.form("change_pw"):
+            cur_pw = st.text_input(tr("current_pw"), type="password")
+            new_pw = st.text_input(tr("new_pw"), type="password")
+            if st.form_submit_button(tr("change_pw_btn")):
+                if len(new_pw) < 8:
+                    st.error(tr("err_pw_short"))
+                elif db.change_password(st.session_state["user_id"], cur_pw, new_pw):
+                    st.success(tr("pw_changed"))
+                else:
+                    st.error(tr("pw_wrong"))
+    if st.button(tr("logout_btn"), width="stretch"):
+        logout()
         st.rerun()
 
-categories_raw = db.get_household_categories(household_id)
-if not categories_raw:
-    seed_default_categories(household_id)
-    categories_raw = db.get_household_categories(household_id)
+categories = db.get_household_categories(household_id)
+cat_keys = [c["en"] for c in categories]
+cat_label = {c["en"]: (c["he"] if is_he else c["en"]) for c in categories}
 
-cat_en_to_he = {c["en"]: c["he"] for c in categories_raw} if categories_raw else {}
-cat_display_map = {c["en"]: (c["he"] if is_he else c["en"]) for c in categories_raw} if categories_raw else {}
 
-# Fetch Inventory
-conn = db.get_connection()
-cursor = conn.cursor()
-cursor.execute(
-    "SELECT id, item_name_en, item_name_he, category, units, purchase_date, user_lambda FROM inventory WHERE household_id = ?",
-    (household_id,)
-)
-raw_inventory = cursor.fetchall()
-conn.close()
+def cat_fmt(key):
+    return cat_label.get(key, key or "—")
 
-pantry_items = []
-low_stock_candidates = []
 
-for row in raw_inventory:
-    p_date = datetime.strptime(row["purchase_date"], "%Y-%m-%d").date()
-    days_elapsed = (today - p_date).days
-    units_qty = max(1, row["units"] if row["units"] else 1)
+def name_of(row) -> str:
+    he = row.get("name_he", row.get("item_name_he"))
+    en = row.get("name_en", row.get("item_name_en"))
+    return (he if is_he and he else en) or he or ""
 
-    prob_depleted = engine.compute_depletion_probability(
-        category=row["category"],
-        days_elapsed=days_elapsed,
-        user_lambda=row["user_lambda"],
-        units_qty=units_qty
-    )
-    name_display = row["item_name_he"] if (is_he and row["item_name_he"]) else row["item_name_en"]
-    category_display = cat_display_map.get(row["category"], row["category"])
 
-    item_dict = {
-        "id": row["id"],
-        "name_en": row["item_name_en"],
-        "name_he": row["item_name_he"],
-        "display_name": name_display,
-        "category": row["category"],
-        "category_display": category_display,
-        "units": units_qty,
-        "purchase_date": row["purchase_date"],
-        "days_elapsed": days_elapsed,
-        "lambda": row["user_lambda"],
-        "prob_depleted": prob_depleted
-    }
-    pantry_items.append(item_dict)
-    if prob_depleted >= 0.65:
-        low_stock_candidates.append(item_dict)
+def cat_options_with(current):
+    """Category list that always contains the item's current category (avoids silent reassignment)."""
+    opts = list(cat_keys)
+    if current and current not in opts:
+        opts.append(current)
+    return opts
 
-# --- DIALOGS ---
-@st.dialog("🔔 Morning Restock Alert")
-def restock_alert_dialog(candidates, h_id, d_name, today_s):
-    st.write("These items have a high probability of being depleted. Select items to restock or extend their lifespan.")
-    selected_ids = [item['id'] for item in candidates if st.session_state.get(f"restk_{item['id']}")]
-    
-    if selected_ids:
-        st.markdown(f"**Actions for {len(selected_ids)} selected items:**")
-        b1, b2 = st.columns(2)
-        
-        if b1.button("🛒 Add to List", use_container_width=True, type="primary"):
-            conn = db.get_connection()
-            c = conn.cursor()
-            c.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_o FROM shopping_list WHERE household_id = ?", (h_id,))
-            curr_order = c.fetchone()["max_o"]
-            
-            for i_id in selected_ids:
-                item = next(i for i in candidates if i['id'] == i_id)
-                curr_order += 1
-                c.execute(
-                    "INSERT INTO shopping_list (household_id, item_name_en, item_name_he, category, source, sort_order, added_at, added_by) VALUES (?, ?, ?, ?, 'smart_alert', ?, ?, ?)",
-                    (h_id, item["name_en"], item["name_he"], item["category"], curr_order, today_s, d_name)
-                )
-            conn.commit()
-            conn.close()
-            for cid in selected_ids:
-                st.session_state[f"restk_{cid}"] = False
-            st.success("Items added to shopping list!")
-            st.rerun()
-            
-        if b2.button("🕰️ Still Going", use_container_width=True):
-            conn = db.get_connection()
-            c = conn.cursor()
-            for i_id in selected_ids:
-                c.execute(
-                    "UPDATE inventory SET purchase_date = ? WHERE id = ? AND household_id = ?",
-                    (today_s, i_id, h_id)
-                )
-            conn.commit()
-            conn.close()
-            for cid in selected_ids:
-                st.session_state[f"restk_{cid}"] = False
-            st.toast("Item lifespans successfully extended!")
-            st.rerun()
-            
-        st.markdown("---")
 
-    with st.container(height=350, border=True):
-        for item in candidates:
-            c_chk, c_name, c_prob = st.columns([0.15, 0.65, 0.2])
-            with c_chk:
-                st.checkbox(" ", key=f"restk_{item['id']}", label_visibility="collapsed")
-            with c_name:
-                st.markdown(f"**{item['display_name']}**")
-            with c_prob:
-                st.markdown(f"🚨 **{int(item['prob_depleted']*100)}%**")
+pantry_all = svc.get_pantry(household_id, today)
+for it in pantry_all:
+    it["display_name"] = name_of(it)
+    it["category_display"] = cat_fmt(it["category"])
+candidates = svc.restock_candidates(pantry_all)
 
-@st.dialog("🔀 Merge Selected Items")
-def merge_dialog_ui(selected_ids, items_list, h_id):
-    selected_items = [i for i in items_list if i["id"] in selected_ids]
-    
-    if len(selected_items) < 2:
-        st.warning("Please select at least 2 items to merge.")
+
+# ==========================================================================
+# Dialogs
+# ==========================================================================
+@st.dialog("🔔")
+def restock_dialog(items):
+    st.subheader(tr("restock_title"))
+    st.caption(tr("restock_help"))
+    with st.container(height=320, border=True):
+        for it in items:
+            c1, c2, c3 = st.columns([0.12, 0.66, 0.22])
+            c1.checkbox(" ", key=f"restk_{it['id']}", label_visibility="collapsed")
+            c2.markdown(f"**{it['display_name']}**  \n:gray[{it['category_display']} · {it['days_elapsed']}d]")
+            c3.markdown(f"🚨 **{int(it['prob_depleted'] * 100)}%**")
+
+    chosen = [it for it in items if st.session_state.get(f"restk_{it['id']}")]
+    b1, b2, b3 = st.columns(3)
+    if b1.button(tr("add_to_list"), type="primary", disabled=not chosen, width="stretch"):
+        svc.add_to_shopping_list(household_id, chosen, "smart_alert", display_name, today)
+        clear_keys("restk_")
+        st.rerun()
+    if b2.button(tr("still_going"), disabled=not chosen, width="stretch"):
+        svc.mark_still_going(household_id, [i["id"] for i in chosen], today)
+        clear_keys("restk_")
+        st.rerun()
+    if b3.button(tr("ran_out"), disabled=not chosen, width="stretch"):
+        svc.mark_depleted(household_id, [i["id"] for i in chosen], today, display_name)
+        clear_keys("restk_")
+        st.rerun()
+
+
+@st.dialog("🔀")
+def merge_dialog(selected):
+    if len(selected) < 2:
+        st.warning("Select at least 2 items to merge.")
         return
-
-    st.write("Choose the **'father'** item. All other selected items will be deleted, and their units will be folded into the father.")
-    father = st.selectbox(
-        "Select Father Item:", 
-        options=selected_items, 
-        format_func=lambda x: f"{x['display_name']} ({x['units']} units - {x['category_display']})"
-    )
-    
-    if st.button("Confirm Merge", type="primary"):
-        children = [i for i in selected_items if i['id'] != father['id']]
-        extra_units = sum([c['units'] for c in children])
-        child_ids = [c['id'] for c in children]
-        
-        conn = db.get_connection()
-        c = conn.cursor()
-        c.execute("UPDATE inventory SET units = units + ? WHERE id = ?", (extra_units, father['id']))
-        placeholders = ",".join("?" * len(child_ids))
-        c.execute(f"DELETE FROM inventory WHERE id IN ({placeholders}) AND household_id = ?", (*child_ids, h_id))
-        conn.commit()
-        conn.close()
-        
-        for cid in selected_ids:
-            if f"chk_{cid}" in st.session_state:
-                st.session_state[f"chk_{cid}"] = False
-        
-        st.success("Items successfully merged!")
+    st.write("Pick the item to keep. The others' units are added to it and they are removed.")
+    keep = st.selectbox("Keep", selected,
+                        format_func=lambda x: f"{x['display_name']} ×{x['units']} ({x['category_display']})")
+    if st.button("Confirm merge", type="primary"):
+        svc.merge_items(household_id, keep["id"], [i["id"] for i in selected])
+        clear_keys("chk_")
         st.rerun()
 
-# --- RESTOCK BANNER ---
-if low_stock_candidates:
-    if st.button("🔔 Morning Restock Alert: High probability of depletion!", type="primary", use_container_width=True):
-        restock_alert_dialog(low_stock_candidates, household_id, display_name, today_str)
-    st.markdown("---")
 
-tab_pantry, tab_shopping, tab_categories, tab_curves = st.tabs([
-    L["tab_pantry"],
-    L["tab_shopping"],
-    L["tab_categories"],
-    L["tab_curves"]
-])
+if candidates:
+    if st.button(tr("restock_banner", n=len(candidates)), type="primary", width="stretch"):
+        restock_dialog(candidates)
 
-# --- TAB 1: SHARED PANTRY ---
+tab_pantry, tab_shopping, tab_categories, tab_curves = st.tabs(
+    [tr("tab_pantry"), tr("tab_shopping"), tr("tab_categories"), tr("tab_curves")])
+
+# ==========================================================================
+# Tab 1: Pantry
+# ==========================================================================
 with tab_pantry:
-    st.subheader(household_name)
-
-    with st.expander(L["manual_add_pantry"]):
-        with st.form("manual_add_pantry_form"):
-            col_p1, col_p2, col_p3 = st.columns([2, 2, 1])
-            with col_p1:
-                p_name_en = st.text_input(L["item_name_en"], placeholder="e.g. 3% Milk")
-                p_cat_en = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], format_func=lambda x: cat_display_map.get(x, x), key="p_cat_select")
-            with col_p2:
-                p_name_he = st.text_input(L["item_name_he"], placeholder="למשל: חלב 3%")
-                p_date = st.date_input(L["purchase_date"], value=today, key="p_date_picker")
-            with col_p3:
-                p_qty = st.number_input(L["units"], min_value=1, value=1, step=1)
-                st.markdown("<br>", unsafe_allow_html=True)
-                p_submit = st.form_submit_button(L["save_btn"])
-
-            if p_submit:
-                final_en = p_name_en.strip() or p_name_he.strip()
-                final_he = p_name_he.strip() or p_name_en.strip()
-                if final_en:
-                    conn = db.get_connection()
-                    c = conn.cursor()
-                    c.execute(
-                        "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
-                        (household_id, final_en, final_he, p_cat_en, int(p_qty), p_date.strftime("%Y-%m-%d"))
-                    )
-                    conn.commit()
-                    conn.close()
-                    st.success("Item added to pantry!")
+    with st.expander(tr("manual_add_pantry")):
+        with st.form("add_purchase", clear_on_submit=True):
+            c1, c2, c3 = st.columns([2, 2, 1])
+            p_en = c1.text_input(tr("item_name_en"), placeholder="e.g. 3% Milk")
+            p_cat = c1.selectbox(tr("category"), cat_keys, format_func=cat_fmt)
+            p_he = c2.text_input(tr("item_name_he"), placeholder="למשל: חלב 3%")
+            p_date = c2.date_input(tr("purchase_date"), value=today, max_value=today,
+                                   min_value=today - timedelta(days=365))
+            p_qty = c3.number_input(tr("units"), min_value=1, value=1, step=1)
+            if st.form_submit_button(tr("save_btn"), type="primary"):
+                if not (p_en.strip() or p_he.strip()):
+                    st.error(tr("need_name"))
+                else:
+                    svc.record_purchase(household_id, p_en, p_he, p_cat, int(p_qty), p_date, display_name)
                     st.rerun()
 
-    with st.expander("📊 Recent Purchases & Mathematical Audit (Last 60 Days)"):
-        st.caption("Inspect and export all raw parameters, Bayesian shrinkage calculations, and Weibull probabilities to CSV.")
-        
-        conn = db.get_connection()
-        c = conn.cursor()
-        c.execute("""
-            SELECT id, item_name_en, item_name_he, category, units, purchase_date, recorded_at, recorded_by
-            FROM purchases
-            WHERE household_id = ? AND purchase_date >= date(?, '-60 days')
-            ORDER BY purchase_date DESC
-        """, (household_id, today_str))
-        recent_purchases_rows = [dict(r) for r in c.fetchall()]
-        
-        if not recent_purchases_rows:
-            c.execute("""
-                SELECT id, item_name_en, item_name_he, category, units, purchase_date, 'inventory' as recorded_at, 'system' as recorded_by
-                FROM inventory
-                WHERE household_id = ? AND purchase_date >= date(?, '-60 days')
-                ORDER BY purchase_date DESC
-            """, (household_id, today_str))
-            recent_purchases_rows = [dict(r) for r in c.fetchall()]
+    with st.expander(tr("audit")):
+        if st.toggle("Show", key="show_audit"):  # only query when someone actually looks
+            recent = svc.recent_purchases(household_id, 60, today)
+            if recent:
+                df = pd.DataFrame(recent)
+                df["category"] = df["category"].map(cat_fmt)
+                st.dataframe(df, width="stretch", hide_index=True)
+            else:
+                st.info(tr("audit_none"))
 
-        audit_records = []
-        for p in recent_purchases_rows:
-            p_date = datetime.strptime(p["purchase_date"], "%Y-%m-%d").date()
-            days_el = (today - p_date).days
-            units_q = max(1, p["units"] or 1)
-            cat = p["category"]
-
-            params = engine.get_category_parameters(cat)
-            rho = params.get("rho", 1.25)
-            prior_lambda = np.exp(params.get("lambda_intercept", np.log(14.0)))
-
-            c.execute("SELECT interval_days FROM purchase_history WHERE household_id = ? AND category = ?", (household_id, cat))
-            recorded_intervals = [r["interval_days"] for r in c.fetchall()]
-            n_intervals = len(recorded_intervals)
-            mean_interval = float(np.mean(recorded_intervals)) if recorded_intervals else None
-
-            user_lam = engine.update_user_scale(cat, recorded_intervals) if recorded_intervals else prior_lambda
-            scale_lambda = user_lam * units_q
-            
-            depletion_p = engine.compute_depletion_probability(
-                category=cat,
-                days_elapsed=days_el,
-                user_lambda=user_lam,
-                units_qty=units_q
-            )
-
-            audit_records.append({
-                "Purchase ID": p["id"],
-                "Item Name": p["item_name_en"],
-                "Category": cat,
-                "Units": units_q,
-                "Purchase Date": p["purchase_date"],
-                "Days Elapsed": days_el,
-                "Baseline Prior (λ₀)": round(prior_lambda, 2),
-                "Weibull Rho (ρ)": rho,
-                "History Count (n)": n_intervals,
-                "Mean Interval (x̄)": round(mean_interval, 2) if mean_interval else "N/A",
-                "Household Velocity (λ)": round(user_lam, 2),
-                "Effective Scale (λ * units)": round(scale_lambda, 2),
-                "Depletion Probability": round(depletion_p, 4),
-                "Depletion Risk (%)": f"{int(depletion_p * 100)}%"
-            })
-        conn.close()
-
-        if audit_records:
-            audit_df = pd.DataFrame(audit_records)
-            st.dataframe(audit_df, use_container_width=True)
-
-            csv_buffer = audit_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="📥 Download Recent Purchases CSV (60 Days)",
-                data=csv_buffer,
-                file_name=f"recent_purchases_audit_{household_code}_{today_str}.csv",
-                mime="text/csv",
-                key="btn_download_recent_purchases"
-            )
-        else:
-            st.info("No purchases recorded in the last 60 days.")
-
-    if not pantry_items:
-        st.info(L["empty_pantry"])
+    if not pantry_all:
+        st.info(tr("empty_pantry"))
     else:
-        col_search, col_filter = st.columns([2, 1])
-        with col_search:
-            search_term = st.text_input("🔍 Search Pantry...", "").strip().lower()
-        with col_filter:
-            cat_options = ["All Categories"] + [c["en"] for c in categories_raw] if categories_raw else ["All Categories"]
-            selected_cat = st.selectbox(
-                "🏷️ Filter by Category", 
-                options=cat_options, 
-                format_func=lambda x: "All Categories" if x == "All Categories" else cat_display_map.get(x, x),
-                label_visibility="collapsed"
-            )
+        f1, f2, f3 = st.columns([2, 1, 1])
+        search = f1.text_input(tr("search"), key="pantry_search", label_visibility="collapsed",
+                               placeholder=tr("search")).strip().lower()
+        cat_filter = f2.selectbox(tr("category"), [None] + cat_keys, key="pantry_cat", label_visibility="collapsed",
+                                  format_func=lambda x: tr("all_categories") if x is None else cat_fmt(x))
+        sort_opts = ["risk", "category", "name", "date"]
+        sort_by = f3.selectbox(tr("sort_by"), sort_opts, key="pantry_sort", label_visibility="collapsed",
+                               format_func=lambda x: tr(f"sort_{x}"))
 
-        if search_term:
-            pantry_items = [
-                i for i in pantry_items 
-                if search_term in str(i["name_en"]).lower() or search_term in str(i["name_he"]).lower()
-            ]
-            
-        if selected_cat != "All Categories":
-            pantry_items = [i for i in pantry_items if i["category"] == selected_cat]
+        items = [i for i in pantry_all
+                 if (not search or search in (i["name_en"] or "").lower() or search in (i["name_he"] or "").lower())
+                 and (cat_filter is None or i["category"] == cat_filter)]
+        sorters = {
+            "risk": lambda x: -x["prob_depleted"],
+            "category": lambda x: (x["category_display"].lower(), x["display_name"].lower()),
+            "name": lambda x: x["display_name"].lower(),
+            "date": lambda x: x["purchase_date"],
+        }
+        items.sort(key=sorters[sort_by], reverse=(sort_by == "date"))
 
-        selected_ids = [item["id"] for item in pantry_items if st.session_state.get(f"chk_{item['id']}")]
-        
-        if selected_ids:
-            st.markdown(f"**Bulk Actions ({len(selected_ids)} items selected):**")
-            b1, b2, b3, b4, b5 = st.columns(5)
-            
-            if b1.button("🗑️ Delete", use_container_width=True):
-                conn = db.get_connection()
-                c = conn.cursor()
-                placeholders = ",".join("?" * len(selected_ids))
-                c.execute(f"DELETE FROM inventory WHERE id IN ({placeholders}) AND household_id = ?", (*selected_ids, household_id))
-                conn.commit()
-                conn.close()
-                for cid in selected_ids:
-                    st.session_state[f"chk_{cid}"] = False
-                st.rerun()
-                
-            if b2.button("🔀 Merge", use_container_width=True):
-                merge_dialog_ui(selected_ids, pantry_items, household_id)
-                
-            if b3.button("🛒 Add to List", use_container_width=True):
-                conn = db.get_connection()
-                c = conn.cursor()
-                c.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_o FROM shopping_list WHERE household_id = ?", (household_id,))
-                curr_order = c.fetchone()["max_o"]
-                
-                for i_id in selected_ids:
-                    item = next(i for i in pantry_items if i['id'] == i_id)
-                    curr_order += 1
-                    c.execute(
-                        "INSERT INTO shopping_list (household_id, item_name_en, item_name_he, category, source, sort_order, added_at, added_by) VALUES (?, ?, ?, ?, 'manual', ?, ?, ?)",
-                        (household_id, item["name_en"], item["name_he"], item["category"], curr_order, today_str, display_name)
-                    )
-                conn.commit()
-                conn.close()
-                for cid in selected_ids:
-                    st.session_state[f"chk_{cid}"] = False
-                st.success(f"Added {len(selected_ids)} items to shopping list!")
-                st.rerun()
-                
-            if b4.button("❌ Ran Out", use_container_width=True):
-                conn = db.get_connection()
-                c = conn.cursor()
-                for cid in selected_ids:
-                    c.execute("DELETE FROM inventory WHERE id = ? AND household_id = ?", (cid, household_id))
-                    st.session_state[f"chk_{cid}"] = False
-                conn.commit()
-                conn.close()
-                st.rerun()
+        selected = [i for i in items if st.session_state.get(f"chk_{i['id']}")]
+        if selected:
+            ids = [i["id"] for i in selected]
+            st.markdown(f"**{tr('selected_n', n=len(selected))}**")
+            b = st.columns(5)
+            if b[0].button(tr("ran_out"), width="stretch"):
+                svc.mark_depleted(household_id, ids, today, display_name)
+                clear_keys("chk_"); st.rerun()
+            if b[1].button(tr("still_going"), width="stretch"):
+                svc.mark_still_going(household_id, ids, today)
+                clear_keys("chk_"); st.rerun()
+            if b[2].button(tr("add_to_list"), width="stretch"):
+                svc.add_to_shopping_list(household_id, selected, "manual", display_name, today)
+                clear_keys("chk_"); st.rerun()
+            if b[3].button(tr("merge"), width="stretch"):
+                merge_dialog(selected)
+            if b[4].button(tr("delete"), width="stretch", help="Remove a mistaken entry (doesn't teach the model)"):
+                svc.delete_items(household_id, ids)
+                clear_keys("chk_"); st.rerun()
+            st.divider()
 
-            if b5.button("🕰️ Still Going", use_container_width=True):
-                conn = db.get_connection()
-                c = conn.cursor()
-                for cid in selected_ids:
-                    c.execute(
-                        "UPDATE inventory SET purchase_date = ? WHERE id = ? AND household_id = ?",
-                        (today_str, cid, household_id)
-                    )
-                    st.session_state[f"chk_{cid}"] = False
-                conn.commit()
-                conn.close()
-                st.toast("Item lifespan extended - countdown restarted from today!")
-                st.rerun()
-                
-            st.markdown("---")
-
-        sort_opts = [L["sort_category"], L["sort_risk"], L["sort_name"], L["sort_date"]]
-        export_df = pd.DataFrame(pantry_items)[[
-            "id", "name_en", "name_he", "category", "units", 
-            "purchase_date", "days_elapsed", "prob_depleted", "lambda"
-        ]].rename(columns={
-            "id": "Item ID",
-            "name_en": "Item Name (EN)",
-            "name_he": "Item Name (HE)",
-            "category": "Category",
-            "units": "Units Qty",
-            "purchase_date": "Purchase Date",
-            "days_elapsed": "Days Since Purchase",
-            "prob_depleted": "Depletion Probability",
-            "lambda": "Household Velocity (Lambda, Per Unit)"
-        })
-
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            export_df.to_excel(writer, sheet_name="Pantry_Inventory", index=False)
-        excel_data = excel_buffer.getvalue()
-
-        col_sort, col_export = st.columns([3, 1])
-        with col_sort:
-            sort_choice = st.selectbox(L["sort_pantry_label"], sort_opts, key="pantry_sort")
-        with col_export:
-            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            st.download_button(
-                label="📥 Export to Excel",
-                data=excel_data,
-                file_name=f"pantry_inventory_{today_str}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="export_pantry_excel"
-            )
-
-        if sort_choice == L["sort_category"]:
-            pantry_items = sorted(pantry_items, key=lambda x: (x["category_display"].lower(), x["display_name"].lower()))
-        elif sort_choice == L["sort_risk"]:
-            pantry_items = sorted(pantry_items, key=lambda x: x["prob_depleted"], reverse=True)
-        elif sort_choice == L["sort_name"]:
-            pantry_items = sorted(pantry_items, key=lambda x: x["display_name"].lower())
-        elif sort_choice == L["sort_date"]:
-            pantry_items = sorted(pantry_items, key=lambda x: x["purchase_date"], reverse=True)
-
-        for item in pantry_items:
-            c_chk, c1, c2, c3, c_edit = st.columns([0.4, 3, 2, 1.5, 0.8])
-            
-            with c_chk:
-                st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-                st.checkbox(" ", key=f"chk_{item['id']}", label_visibility="collapsed")
-                
+        for it in items:
+            c_chk, c1, c2, c_edit = st.columns([0.4, 3.4, 2.6, 0.6])
+            c_chk.checkbox(" ", key=f"chk_{it['id']}", label_visibility="collapsed")
             with c1:
-                qty_badge = f" **(x{item['units']})**" if item['units'] > 1 else ""
-                st.markdown(f"**{item['display_name']}**{qty_badge}")
-                st.caption(f"🏷️ `{item['category_display']}` | {item['purchase_date']} ({item['days_elapsed']}d)")
-                
+                qty = f" ×{it['units']}" if it["units"] > 1 else ""
+                badges = []
+                if it["on_shopping_list"]:
+                    badges.append(tr("on_list_badge"))
+                if it["confirmed_until"]:
+                    badges.append(tr("confirmed_badge", date=it["confirmed_until"]))
+                st.markdown(f"**{it['display_name']}**{qty}  " + ("  ".join(f":blue-badge[{b}]" for b in badges)))
+                st.caption(f"🏷️ {it['category_display']} · {it['purchase_date']} ({it['days_elapsed']}d) · "
+                           + tr("lasts", d=round(it["effective_scale"])))
             with c2:
-                prob = item["prob_depleted"]
-                st.progress(min(1.0, prob))
-                st.caption(f"{L['depletion_risk']}: **{int(prob*100)}%**")
-                
-            with c3:
-                lambda_val = f"{item['lambda']:.1f}d" if item['lambda'] else "14.0d"
-                st.caption(f"{L['household_velocity']}: **{lambda_val}**")
-
+                p = it["prob_depleted"]
+                st.progress(p)
+                st.caption(f"{tr('depletion_risk')}: **{int(p * 100)}%**")
             with c_edit:
                 with st.popover("✏️"):
-                    st.markdown(f"**{L['edit_tooltip']}**")
-                    with st.form(f"edit_pantry_{item['id']}"):
-                        new_en = st.text_input(L["item_name_en"], value=item["name_en"])
-                        new_he = st.text_input(L["item_name_he"], value=item["name_he"])
-                        new_qty = st.number_input(L["units"], min_value=1, value=item["units"], step=1)
-                        curr_cat_idx = [c["en"] for c in categories_raw].index(item["category"]) if item["category"] in [c["en"] for c in categories_raw] else 0
-                        new_cat = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], index=curr_cat_idx, format_func=lambda x: cat_display_map.get(x, x))
-                        if st.form_submit_button(L["update_btn"]):
-                            conn = db.get_connection()
-                            c = conn.cursor()
-                            c.execute(
-                                "UPDATE inventory SET item_name_en = ?, item_name_he = ?, category = ?, units = ? WHERE id = ? AND household_id = ?",
-                                (new_en.strip(), new_he.strip(), new_cat, int(new_qty), item["id"], household_id)
-                            )
-                            conn.commit()
-                            conn.close()
+                    with st.form(f"edit_{it['id']}"):
+                        st.markdown(f"**{tr('edit')}**")
+                        e_en = st.text_input(tr("item_name_en"), value=it["name_en"] or "")
+                        e_he = st.text_input(tr("item_name_he"), value=it["name_he"] or "")
+                        e_qty = st.number_input(tr("units"), min_value=1, value=int(it["units"]), step=1)
+                        opts = cat_options_with(it["category"])
+                        e_cat = st.selectbox(tr("category"), opts, format_func=cat_fmt,
+                                             index=opts.index(it["category"]) if it["category"] in opts else 0)
+                        if st.form_submit_button(tr("update_btn")):
+                            svc.update_item(household_id, it["id"], e_en, e_he, e_cat, e_qty)
                             st.rerun()
 
-# --- TAB 2: SHOPPING LIST ---
+        export = pd.DataFrame([{
+            "Item (EN)": i["name_en"], "Item (HE)": i["name_he"], "Category": i["category"], "Units": i["units"],
+            "Purchase date": i["purchase_date"], "Days since purchase": i["days_elapsed"],
+            "Still had it on": i["confirmed_until"], "Chance it's gone": round(i["prob_depleted"], 3),
+            "Per-unit scale (days)": round(i["per_unit_scale"], 1),
+        } for i in pantry_all])
+        st.download_button(tr("export"), export.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"pantry_{today}.csv", mime="text/csv")
+
+# ==========================================================================
+# Tab 2: Shopping list
+# ==========================================================================
 with tab_shopping:
-    st.subheader(L["tab_shopping"])
-
-    with st.expander(L["manual_add_shop"], expanded=False):
-        with st.form("manual_add_shop_form"):
-            col_s1, col_s2 = st.columns(2)
-            with col_s1:
-                s_name_en = st.text_input(L["item_name_en"], placeholder="e.g. Sourdough Bread")
-                s_cat_en = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], format_func=lambda x: cat_display_map.get(x, x), key="s_cat_select")
-            with col_s2:
-                s_name_he = st.text_input(L["item_name_he"], placeholder="למשל: לחם מחמצת")
-
-            s_submit = st.form_submit_button(L["save_btn"])
-            if s_submit:
-                final_en = s_name_en.strip() or s_name_he.strip()
-                final_he = s_name_he.strip() or s_name_en.strip()
-                if final_en:
-                    conn = db.get_connection()
-                    c = conn.cursor()
-                    c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_o FROM shopping_list WHERE household_id = ?", (household_id,))
-                    next_o = c.fetchone()["next_o"]
-                    c.execute(
-                        "INSERT INTO shopping_list (household_id, item_name_en, item_name_he, category, source, sort_order, added_at, added_by) VALUES (?, ?, ?, ?, 'manual', ?, ?, ?)",
-                        (household_id, final_en, final_he, s_cat_en, next_o, today_str, display_name)
-                    )
-                    conn.commit()
-                    conn.close()
+    with st.expander(tr("manual_add_shop")):
+        with st.form("add_shop", clear_on_submit=True):
+            c1, c2, c3 = st.columns([2, 2, 2])
+            s_en = c1.text_input(tr("item_name_en"), placeholder="e.g. Sourdough bread")
+            s_he = c2.text_input(tr("item_name_he"), placeholder="למשל: לחם מחמצת")
+            s_cat = c3.selectbox(tr("category"), cat_keys, format_func=cat_fmt)
+            if st.form_submit_button(tr("save_btn"), type="primary"):
+                if not (s_en.strip() or s_he.strip()):
+                    st.error(tr("need_name"))
+                else:
+                    svc.add_to_shopping_list(household_id, [{
+                        "name_en": s_en.strip() or s_he.strip(), "name_he": s_he.strip() or s_en.strip(),
+                        "category": s_cat}], "manual", display_name, today)
                     st.rerun()
 
-    conn = db.get_connection()
-    c = conn.cursor()
-    c.execute("SELECT id, item_name_en, item_name_he, category, source, sort_order, added_at, added_by FROM shopping_list WHERE household_id = ?", (household_id,))
-    shopping_rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-
-    if not shopping_rows:
-        st.write(L["empty_list"])
+    shop_all = svc.get_shopping_list(household_id)
+    if not shop_all:
+        st.write(tr("empty_list"))
     else:
-        for r in shopping_rows:
-            r["display_name"] = r["item_name_he"] if (is_he and r["item_name_he"]) else r["item_name_en"]
-            r["category_display"] = cat_display_map.get(r["category"], r["category"])
+        for r in shop_all:
+            r["display_name"] = name_of(r)
+            r["category_display"] = cat_fmt(r["category"])
 
-        col_s_search, col_s_filter = st.columns([2, 1])
-        with col_s_search:
-            shop_search_term = st.text_input("🔍 Search Shopping List...", "").strip().lower()
-        with col_s_filter:
-            shop_cat_options = ["All Categories"] + [c["en"] for c in categories_raw] if categories_raw else ["All Categories"]
-            shop_selected_cat = st.selectbox(
-                "🏷️ Filter by Category", 
-                options=shop_cat_options, 
-                format_func=lambda x: "All Categories" if x == "All Categories" else cat_display_map.get(x, x),
-                key="shop_cat_filter",
-                label_visibility="collapsed"
-            )
+        f1, f2, f3 = st.columns([2, 1, 1.4])
+        s_search = f1.text_input(tr("search"), key="shop_search", label_visibility="collapsed",
+                                 placeholder=tr("search")).strip().lower()
+        s_filter = f2.selectbox(tr("category"), [None] + cat_keys, key="shop_cat", label_visibility="collapsed",
+                                format_func=lambda x: tr("all_categories") if x is None else cat_fmt(x))
+        order = f3.selectbox(tr("org_label"), ["custom", "category", "name"], key="shop_order",
+                             label_visibility="collapsed", format_func=lambda x: tr(f"org_{x}"))
 
-        if shop_search_term:
-            shopping_rows = [
-                r for r in shopping_rows 
-                if shop_search_term in str(r["item_name_en"]).lower() or shop_search_term in str(r["item_name_he"]).lower()
-            ]
-            
-        if shop_selected_cat != "All Categories":
-            shopping_rows = [r for r in shopping_rows if r["category"] == shop_selected_cat]
+        rows = [r for r in shop_all
+                if (not s_search or s_search in (r["item_name_en"] or "").lower()
+                    or s_search in (r["item_name_he"] or "").lower())
+                and (s_filter is None or r["category"] == s_filter)]
+        is_filtered = len(rows) != len(shop_all)
 
-        shop_sort = st.radio(
-            L["org_label"],
-            [L["org_custom"], L["org_category"], L["org_name"]],
-            horizontal=True
-        )
+        if order == "category":
+            rows.sort(key=lambda x: (x["category_display"].lower(), x["display_name"].lower()))
+        elif order == "name":
+            rows.sort(key=lambda x: x["display_name"].lower())
+        elif HAS_SORTABLES and not is_filtered and len(rows) > 1:
+            st.caption(tr("drag_caption"))
+            labels = {r["id"]: f"{r['display_name']} · {r['category_display']}  #{r['id']}" for r in rows}
+            current = [labels[r["id"]] for r in rows]
+            reordered = sort_items(current, direction="vertical", key=f"dnd_{household_id}")
+            if reordered and reordered != current:
+                by_label = {v: k for k, v in labels.items()}
+                svc.reorder_shopping_list(household_id, [by_label[lbl] for lbl in reordered])
+                st.rerun()
+        elif is_filtered:
+            st.caption(tr("drag_filtered"))
+        elif not HAS_SORTABLES:
+            st.caption(tr("sortables_missing"))
 
-        if shop_sort == L["org_custom"]:
-            shopping_rows = sorted(shopping_rows, key=lambda x: x["sort_order"])
-
-            if HAS_SORTABLES:
-                st.caption(L["drag_drop_caption"])
-                id_to_label = {r["id"]: f"📌 {r['display_name']} ({r['category_display']}) #{r['id']}" for r in shopping_rows}
-                label_to_id = {v: k for k, v in id_to_label.items()}
-                current_labels = [id_to_label[r["id"]] for r in shopping_rows]
-
-                reordered = sort_items(current_labels, direction="vertical", key=f"dnd_{household_id}")
-                if reordered and reordered != current_labels:
-                    conn = db.get_connection()
-                    c = conn.cursor()
-                    for new_idx, lbl in enumerate(reordered):
-                        item_id = label_to_id[lbl]
-                        c.execute("UPDATE shopping_list SET sort_order = ? WHERE id = ? AND household_id = ?", (new_idx, item_id, household_id))
-                    conn.commit()
-                    conn.close()
-                    st.rerun()
-            else:
-                st.warning(L["install_sortables_warning"])
-
-        elif shop_sort == L["org_category"]:
-            shopping_rows = sorted(shopping_rows, key=lambda x: (x["category_display"].lower(), x["display_name"].lower()))
-        elif shop_sort == L["org_name"]:
-            shopping_rows = sorted(shopping_rows, key=lambda x: x["display_name"].lower())
-
-        st.markdown("---")
-
-        for idx, row in enumerate(shopping_rows):
-            sc1, sc2, sc3, sc4, sc5 = st.columns([4, 2, 0.6, 0.6, 1.2])
-
-            with sc1:
-                added_by = f" *(by {row['added_by']})*" if row['added_by'] else ""
-                st.markdown(f"**{row['display_name']}**{added_by}")
-            with sc2:
-                st.caption(f"🏷️ {row['category_display']}")
-
-            with sc3:
+        st.divider()
+        for r in rows:
+            c1, c2, c3, c4, c5 = st.columns([3.6, 1.8, 0.6, 0.6, 1.2])
+            who = f" :gray[{tr('by', who=r['added_by'])}]" if r["added_by"] else ""
+            c1.markdown(f"**{r['display_name']}**{who}")
+            c2.caption(f"🏷️ {r['category_display']}")
+            with c3:
                 with st.popover("✏️"):
-                    st.markdown(f"**{L['edit_tooltip']}**")
-                    with st.form(f"edit_shop_{row['id']}"):
-                        new_s_en = st.text_input(L["item_name_en"], value=row["item_name_en"])
-                        new_s_he = st.text_input(L["item_name_he"], value=row["item_name_he"])
-                        curr_cat_idx = [c["en"] for c in categories_raw].index(row["category"]) if row["category"] in [c["en"] for c in categories_raw] else 0
-                        new_s_cat = st.selectbox("Category", [c["en"] for c in categories_raw] if categories_raw else [], index=curr_cat_idx, format_func=lambda x: cat_display_map.get(x, x))
-                        if st.form_submit_button(L["update_btn"]):
-                            conn = db.get_connection()
-                            c = conn.cursor()
-                            c.execute(
-                                "UPDATE shopping_list SET item_name_en = ?, item_name_he = ?, category = ? WHERE id = ? AND household_id = ?",
-                                (new_s_en.strip(), new_s_he.strip(), new_s_cat, row["id"], household_id)
-                            )
-                            conn.commit()
-                            conn.close()
+                    with st.form(f"edit_shop_{r['id']}"):
+                        n_en = st.text_input(tr("item_name_en"), value=r["item_name_en"] or "")
+                        n_he = st.text_input(tr("item_name_he"), value=r["item_name_he"] or "")
+                        opts = cat_options_with(r["category"])
+                        n_cat = st.selectbox(tr("category"), opts, format_func=cat_fmt,
+                                             index=opts.index(r["category"]) if r["category"] in opts else 0)
+                        if st.form_submit_button(tr("update_btn")):
+                            svc.update_shopping_item(household_id, r["id"], n_en, n_he, n_cat)
                             st.rerun()
+            if c4.button("🗑️", key=f"del_shop_{r['id']}"):
+                svc.remove_from_shopping_list(household_id, r["id"])
+                st.rerun()
+            if c5.button(tr("bought_btn"), key=f"bought_{r['id']}", width="stretch"):
+                svc.bought_from_list(household_id, r["id"], 1, display_name, today)
+                st.toast(f"✅ {r['display_name']}")
+                st.rerun()
 
-            with sc4:
-                if st.button(L["delete_btn"], key=f"del_shop_{row['id']}", help=L["delete_tooltip"]):
-                    conn = db.get_connection()
-                    c = conn.cursor()
-                    c.execute("DELETE FROM shopping_list WHERE id = ? AND household_id = ?", (row["id"], household_id))
-                    conn.commit()
-                    conn.close()
-                    st.toast(f"Deleted {row['display_name']} from shopping list.")
-                    st.rerun()
-
-            with sc5:
-                if st.button(L["bought_btn"], key=f"bought_{row['id']}"):
-                    conn = db.get_connection()
-                    c = conn.cursor()
-                    c.execute(
-                        "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
-                        (household_id, row["item_name_en"], row["item_name_he"], row["category"], 1, today_str)
-                    )
-                    c.execute("DELETE FROM shopping_list WHERE id = ? AND household_id = ?", (row["id"], household_id))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"Restocked {row['display_name']}!")
-                    st.rerun()
-
-# --- TAB 3: CATEGORIES ---
+# ==========================================================================
+# Tab 3: Categories
+# ==========================================================================
 with tab_categories:
-    st.subheader(L["tab_categories"])
     col_add, col_list = st.columns([2, 3])
-
     with col_add:
-        with st.form("add_cat_form"):
-            new_en = st.text_input("Category (English)", placeholder="e.g. Vegan Alternatives")
-            new_he = st.text_input("Category (Hebrew / עברית)", placeholder="למשל: תחליפי טבעונות")
-            submit = st.form_submit_button("Add / הוסף")
-            if submit and new_en.strip():
-                conn = db.get_connection()
-                c = conn.cursor()
-                try:
-                    c.execute("INSERT INTO household_categories (household_id, name_en, name_he) VALUES (?, ?, ?)", 
-                              (household_id, new_en.strip(), new_he.strip() or new_en.strip()))
-                    conn.commit()
-                    conn.close()
+        with st.form("add_cat", clear_on_submit=True):
+            n_en = st.text_input("Category (English)", placeholder="e.g. Vegan Alternatives")
+            n_he = st.text_input("Category (Hebrew)", placeholder="למשל: תחליפי טבעונות")
+            if st.form_submit_button(tr("cat_add")) and n_en.strip():
+                if db.add_category(household_id, n_en, n_he):
                     st.rerun()
-                except Exception:
-                    conn.close()
-
+                else:
+                    st.error(tr("cat_exists"))
     with col_list:
-        if categories_raw:
-            for cat in categories_raw:
-                c1, c2 = st.columns([4, 1])
-                with c1:
-                    st.markdown(f"• **{cat['en']}** / {cat['he']}")
-                with c2:
-                    if st.button("🗑️", key=f"del_cat_{cat['en']}"):
-                        conn = db.get_connection()
-                        c = conn.cursor()
-                        c.execute("DELETE FROM household_categories WHERE household_id = ? AND name_en = ?", (household_id, cat["en"]))
-                        conn.commit()
-                        conn.close()
-                        st.rerun()
+        for c in categories:
+            l1, l2, l3 = st.columns([3, 2, 0.6])
+            l1.markdown(f"**{c['en']}** / {c['he']}")
+            prior = engine.category_params(c["en"])
+            l2.caption(f"~{prior['median_days']:.0f}d typical" + ("" if prior["prior_key"] else " (default)"))
+            if l3.button("🗑️", key=f"del_cat_{c['id']}"):
+                ok, n = db.delete_category(household_id, c["en"])
+                if ok:
+                    st.rerun()
+                else:
+                    st.error(tr("cat_in_use", n=n))
 
-# --- TAB 4: SURVIVAL CURVES ---
+# ==========================================================================
+# Tab 4: How it predicts
+# ==========================================================================
 with tab_curves:
-    st.subheader(L["tab_curves"])
-    if pantry_items:
-        names = [i["display_name"] for i in pantry_items]
-        selected_name = st.selectbox("Inspect staple curve:", names)
-        selected_item = next(i for i in pantry_items if i["display_name"] == selected_name)
+    if pantry_all:
+        by_id = {i["id"]: i for i in pantry_all}
+        pick = st.selectbox(tr("curve_pick"), list(by_id), key="curve_item",
+                            format_func=lambda i: f"{by_id[i]['display_name']} ({by_id[i]['category_display']})")
+        it = by_id[pick]
+        stats = svc.item_learning_stats(household_id, it["item_key"], it["category"])
 
-        params = engine.get_category_parameters(selected_item["category"])
-        prior_lambda = np.exp(params.get("lambda_intercept", np.log(14.0)))
-        shape_rho = params.get("rho", 1.25)
-        per_unit_lambda = selected_item["lambda"] if selected_item["lambda"] else prior_lambda
-
-        units_qty = max(1, selected_item["units"] or 1)
-        prior_scale = prior_lambda * units_qty
-        user_scale = per_unit_lambda * units_qty
-
-        t_vals = np.linspace(0, max(45, int(user_scale * 2.2)), 100)
-        s_prior = np.exp(- (t_vals / prior_scale) ** shape_rho)
-        s_user = np.exp(- (t_vals / user_scale) ** shape_rho)
+        horizon = max(30, int(it["effective_scale"] * 2.5), it["days_elapsed"] + 5)
+        ts = list(range(0, horizon + 1))
+        prior_curve = engine.survival_curve(it["category"], stats["prior_scale"], it["units"], ts)
+        your_curve = engine.survival_curve(it["category"], it["per_unit_scale"], it["units"], ts, it["days_confirmed"])
 
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=t_vals, y=s_prior, mode="lines", name="Population Baseline", line=dict(dash="dash", color="gray")))
-        fig.add_trace(go.Scatter(x=t_vals, y=s_user, mode="lines", name=f"{household_name} Model", line=dict(color="#2ca02c", width=3)))
-
-        curr_t = selected_item["days_elapsed"]
-        curr_s = np.exp(- (curr_t / user_scale) ** shape_rho)
-        fig.add_trace(go.Scatter(x=[curr_t], y=[curr_s], mode="markers+text", name="Today", marker=dict(size=12, color="red"), text=[f"Day {int(curr_t)}"]))
-
-        fig.update_layout(xaxis_title="Days Since Purchase", yaxis_title="Probability S(t)", template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-
-# --- SIDEBAR QUICK PASTE LIST ---
-st.sidebar.header("📋 Quick Add List")
-st.sidebar.caption("Paste a text list of groceries to add them all at once.")
-pasted_text = st.sidebar.text_area("Items (one per line):", placeholder="Milk\nEggs\nBread", height=140)
-paste_date = st.sidebar.date_input("Purchase Date", value=today, key="paste_date_input")
-
-if st.sidebar.button("⚡ Process List", type="primary"):
-    if pasted_text.strip():
-        with st.spinner("Structuring items with AI..."):
-            raw_items = ingestor.parse_raw_text(pasted_text, household_id)
-            if raw_items:
-                for idx, it in enumerate(raw_items):
-                    it["include"] = True
-                    it["idx"] = idx
-                    if "units" not in it:
-                        it["units"] = 1
-                st.session_state["staged_receipt_items"] = raw_items
-                st.session_state["staged_purchase_date"] = paste_date.strftime("%Y-%m-%d")
-                st.rerun()
+        fig.add_scatter(x=ts, y=prior_curve, mode="lines", name=tr("curve_prior"),
+                        line=dict(dash="dash", color="gray"))
+        fig.add_scatter(x=ts, y=your_curve, mode="lines", name=tr("curve_yours"), line=dict(color="#2ca02c", width=3))
+        fig.add_scatter(x=[it["days_elapsed"]], y=[1 - it["prob_depleted"]], mode="markers+text",
+                        name=tr("curve_today"), marker=dict(size=12, color="red"),
+                        text=[tr("curve_today")], textposition="top right")
+        fig.update_layout(xaxis_title=tr("curve_x"), yaxis_title=tr("curve_y"), template="plotly_white",
+                          yaxis=dict(range=[0, 1.05], tickformat=".0%"), margin=dict(t=20))
+        st.plotly_chart(fig, width="stretch")
+        st.caption(tr("curve_stats", n=stats["item_cycles"], c=stats["category_cycles"],
+                      prior=stats["prior_key"] or "default"))
     else:
-        st.sidebar.error("Paste some items first.")
+        st.info(tr("empty_pantry"))
 
-# --- SIDE-BY-SIDE VERIFICATION WORKSPACE ---
-if st.session_state.get("staged_receipt_items"):
-    st.markdown("---")
-    st.subheader("🧾 List Verification Workspace")
-    st.caption("Verify extracted items and quantities before committing them to the household inventory.")
+# ==========================================================================
+# Sidebar: Quick add from pasted text
+# ==========================================================================
+parser = get_parser()
+st.sidebar.header(tr("quick_add"))
+st.sidebar.caption(tr("quick_add_help"))
+pasted = st.sidebar.text_area(tr("quick_add_items"), placeholder="Milk\n2 eggs\nלחם", height=140, key="paste_text")
+paste_date = st.sidebar.date_input(tr("purchase_date"), value=today, max_value=today, key="paste_date")
+if st.sidebar.button(tr("process"), type="primary", disabled=not parser.available,
+                     help=None if parser.available else "Set OPENAI_API_KEY to enable"):
+    if not pasted.strip():
+        st.sidebar.error(tr("paste_first"))
+    else:
+        try:
+            with st.spinner("…"):
+                parsed = parser.parse(pasted, categories)
+            st.session_state["staged_items"] = parsed
+            st.session_state["staged_date"] = paste_date
+            st.rerun()
+        except RuntimeError as e:
+            st.sidebar.error(str(e))
 
-    edited_df = st.data_editor(
-        pd.DataFrame(st.session_state["staged_receipt_items"])[["include", "item_name_en", "item_name_he", "category", "units"]],
+if st.session_state.get("staged_items"):
+    st.divider()
+    st.subheader(tr("verify_title"))
+    staged = pd.DataFrame(st.session_state["staged_items"])
+    staged.insert(0, "include", True)
+    edited = st.data_editor(
+        staged[["include", "name_en", "name_he", "category", "units"]],
         column_config={
-            "include": st.column_config.CheckboxColumn("Keep?", default=True),
-            "item_name_en": st.column_config.TextColumn("English Name"),
-            "item_name_he": st.column_config.TextColumn("Hebrew Name"),
-            "category": st.column_config.SelectboxColumn("Category", options=[c["en"] for c in categories_raw] if categories_raw else []),
-            "units": st.column_config.NumberColumn("Qty", min_value=1, step=1, default=1)
+            "include": st.column_config.CheckboxColumn(tr("keep"), default=True),
+            "name_en": st.column_config.TextColumn(tr("item_name_en")),
+            "name_he": st.column_config.TextColumn(tr("item_name_he")),
+            "category": st.column_config.SelectboxColumn(tr("category"), options=cat_keys, required=True),
+            "units": st.column_config.NumberColumn(tr("units"), min_value=1, step=1, default=1),
         },
-        hide_index=True,
-        use_container_width=True,
-        key="staged_editor_list"
+        hide_index=True, width="stretch", key="staged_editor",
     )
-
-    btn_c1, btn_c2 = st.columns([1, 1])
-    with btn_c1:
-        if st.button("✅ Commit Items to Pantry", type="primary"):
-            conn = db.get_connection()
-            try:
-                c = conn.cursor()
-                for _, row in edited_df.iterrows():
-                    if row["include"]:
-                        c.execute(
-                            "INSERT INTO inventory (household_id, item_name_en, item_name_he, category, units, purchase_date) VALUES (?, ?, ?, ?, ?, ?)",
-                            (household_id, row["item_name_en"], row["item_name_he"], row["category"], int(row["units"]), st.session_state["staged_purchase_date"])
-                        )
-                conn.commit()
-            finally:
-                conn.close()
-            st.session_state["staged_receipt_items"] = None
-            st.success("All verified items added to pantry!")
+    c1, c2 = st.columns(2)
+    if c1.button(tr("commit"), type="primary"):
+        keep = edited[edited["include"]].copy()
+        keep["name_en"] = keep["name_en"].fillna("").astype(str).str.strip()
+        keep["name_he"] = keep["name_he"].fillna("").astype(str).str.strip()
+        keep = keep[(keep["name_en"] != "") | (keep["name_he"] != "")]
+        missing = keep[keep["category"].isna() | ~keep["category"].isin(cat_keys)]
+        if not missing.empty:
+            st.error(tr("need_category", names=", ".join(missing["name_en"].fillna(missing["name_he"]))))
+        else:
+            records = [{"name_en": r.name_en, "name_he": r.name_he, "category": r.category,
+                        "units": int(r.units or 1)} for r in keep.itertuples()]
+            svc.record_purchases(household_id, records, st.session_state["staged_date"], display_name)
+            st.session_state.pop("staged_items", None)
+            st.toast(tr("saved_n", n=len(records)))
             st.rerun()
-
-    with btn_c2:
-        if st.button("❌ Discard List"):
-            st.session_state["staged_receipt_items"] = None
-            st.rerun()
+    if c2.button(tr("discard")):
+        st.session_state.pop("staged_items", None)
+        st.rerun()

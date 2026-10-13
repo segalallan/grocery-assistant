@@ -1,66 +1,151 @@
-import json
-import os
-import numpy as np
+"""Depletion model. Pure math, no database or Streamlit.
 
-PRIORS_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "category_priors.json")
+Conventions (used everywhere, including the UI):
+  * Consumption time per UNIT follows Weibull(scale=λ, shape=ρ).
+  * A stock row with `units` packages has scale λ * units (linear in units).
+  * Learned values (`user_lambda`) are per-unit SCALES, not means or medians.
+  * Category priors are stored as an intuitive per-unit MEDIAN and converted to a scale.
+"""
+import json
+import logging
+import math
+
+from config import PRIORS_FILE
+
+log = logging.getLogger(__name__)
+
+MIN_RHO = 1.1
+FALLBACK = {"median_days": 14.0, "rho": 1.25}
+CATEGORY_PSEUDO_N = 3.0   # how many observations the population prior is "worth"
+ITEM_PSEUDO_N = 2.0       # how many observations the household-category estimate is "worth"
+
+# Custom category names are matched to a prior by keyword (checked in order).
+CATEGORY_ALIASES = [
+    ("Dairy & Eggs", ["dairy", "milk", "cheese", "egg", "yogurt", "חלב", "ביצים", "גבינ"]),
+    ("Bakery & Bread", ["bread", "bakery", "baked", "לחם", "מאפ"]),
+    ("Produce", ["produce", "fruit", "vegetable", "veg", "פירות", "ירקות"]),
+    ("Meat & Poultry", ["meat", "poultry", "chicken", "fish", "seafood", "בשר", "עוף", "דג"]),
+    ("Frozen Foods", ["frozen", "קפוא"]),
+    ("Beverages", ["beverage", "drink", "juice", "coffee", "tea", "water", "משקא", "קפה"]),
+    ("Snacks", ["snack", "sweet", "candy", "chocolate", "חטיפ", "ממתק"]),
+    ("Cleaning", ["clean", "detergent", "paper", "toilet", "soap", "ניקוי", "נייר"]),
+    ("Pantry Staples", ["pantry", "staple", "canned", "baking", "rice", "pasta", "grain", "spice", "מזווה", "שימורים"]),
+]
+
+
+def mean_to_scale(mean: float, rho: float) -> float:
+    return mean / math.gamma(1.0 + 1.0 / rho)
+
+
+def median_to_scale(median: float, rho: float) -> float:
+    return median / (math.log(2.0) ** (1.0 / rho))
+
+
+def survival(t: float, scale: float, rho: float) -> float:
+    t = max(0.0, float(t))
+    return math.exp(-((t / scale) ** rho))
+
 
 class PantryDepletionEngine:
-    def __init__(self):
-        self.priors = self._load_priors()
+    def __init__(self, priors_path=PRIORS_FILE):
+        self.priors = self._load_priors(priors_path)
+        self._lower = {k.lower(): k for k in self.priors}
 
-    def _load_priors(self):
-        if os.path.exists(PRIORS_FILE):
-            with open(PRIORS_FILE, "r") as f:
+    @staticmethod
+    def _load_priors(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        return {}
+        except FileNotFoundError:
+            log.warning("Priors file not found at %s; every category will use the %s-day fallback.",
+                        path, FALLBACK["median_days"])
+            return {}
 
-    def get_category_parameters(self, category: str):
-        cat_lower = category.lower()
-        for key, vals in self.priors.items():
-            if key.lower() in cat_lower or cat_lower in key.lower():
-                return vals
-        return {"lambda_intercept": float(np.log(14.0)), "rho": 1.25, "median_days": 14.0, "lambda_beta_units": 0.0}
+    # ---------- priors ----------
+    def resolve_category(self, category: str | None) -> str | None:
+        """Which priors entry a household category maps to (exact name first, then keywords)."""
+        if not category:
+            return None
+        cat = category.strip().lower()
+        if cat in self._lower:
+            return self._lower[cat]
+        for target, keywords in CATEGORY_ALIASES:
+            if target in self.priors and any(k in cat for k in keywords):
+                return target
+        return None
 
-    def compute_depletion_probability(self, category: str, days_elapsed: float, user_lambda: float = None, units_qty: int = 1) -> float:
+    def category_params(self, category: str | None) -> dict:
+        key = self.resolve_category(category)
+        params = dict(self.priors.get(key, FALLBACK)) if key else dict(FALLBACK)
+        params["rho"] = max(MIN_RHO, float(params.get("rho", FALLBACK["rho"])))
+        params["median_days"] = float(params.get("median_days", FALLBACK["median_days"]))
+        params["prior_key"] = key
+        return params
+
+    def rho(self, category: str | None) -> float:
+        return self.category_params(category)["rho"]
+
+    def prior_scale(self, category: str | None) -> float:
+        p = self.category_params(category)
+        return median_to_scale(p["median_days"], p["rho"])
+
+    # ---------- learning ----------
+    def estimate_item_scale(self, category: str | None, item_intervals: list[float],
+                            category_intervals: list[float]) -> float:
+        """Per-unit scale for one item, shrunk item → household category → population prior.
+
+        `item_intervals` and `category_intervals` are observed per-unit consumption durations.
         """
-        Two different models depending on whether we have personal history:
+        rho = self.rho(category)
+        cat_scale = self.prior_scale(category)
 
-        - Personalized (user_lambda present): user_lambda is a per-unit
-          day-rate. The correct scale for a batch of units_qty items is 
-          user_lambda * units_qty - the full duration scales up linearly 
-          with how many units were bought.
+        if category_intervals:
+            n = len(category_intervals)
+            obs = mean_to_scale(sum(category_intervals) / n, rho)
+            cat_scale = (CATEGORY_PSEUDO_N * cat_scale + n * obs) / (CATEGORY_PSEUDO_N + n)
 
-        - Cold start (no personal history yet): falls back to the population
-          Weibull-AFT model, which fits log(scale) = lambda_intercept + lambda_beta_units * units_bought.
+        if not item_intervals:
+            return cat_scale
+        n = len(item_intervals)
+        obs = mean_to_scale(sum(item_intervals) / n, rho)
+        return (ITEM_PSEUDO_N * cat_scale + n * obs) / (ITEM_PSEUDO_N + n)
+
+    # ---------- prediction ----------
+    def effective_scale(self, category: str | None, per_unit_scale: float | None, units: int) -> float:
+        base = per_unit_scale if per_unit_scale and per_unit_scale > 0 else self.prior_scale(category)
+        return float(base) * max(1, int(units or 1))
+
+    def depletion_probability(self, category: str | None, days_elapsed: float,
+                              per_unit_scale: float | None = None, units: int = 1,
+                              days_confirmed: float | None = None) -> float:
+        """P(item is used up by now).
+
+        If someone confirmed the item was still there `days_confirmed` days after purchase,
+        this is conditional: 1 - S(t) / S(c).
         """
-        params = self.get_category_parameters(category)
-        
-        # Defensive guardrail: prevent sub-1.0 or unexponentiated log-rho artifacts
-        raw_rho = params.get("rho", 1.25)
-        shape_rho = float(raw_rho) if raw_rho and float(raw_rho) >= 1.15 else 1.25
-        
-        safe_units = max(1, units_qty)
+        t = max(0.0, float(days_elapsed))
+        scale = self.effective_scale(category, per_unit_scale, units)
+        rho = self.rho(category)
+        s_t = survival(t, scale, rho)
 
-        if user_lambda and user_lambda > 0:
-            scale_lambda = user_lambda * safe_units
-        else:
-            lambda_intercept = params.get("lambda_intercept", np.log(14.0))
-            lambda_beta_units = params.get("lambda_beta_units", 0.0)
-            capped_units = min(safe_units, 5)
-            scale_lambda = np.exp(lambda_intercept + lambda_beta_units * capped_units)
+        if days_confirmed is not None and days_confirmed > 0:
+            c = min(float(days_confirmed), t)
+            s_c = survival(c, scale, rho)
+            if s_c <= 1e-12:
+                return 1.0 if t > c else 0.0
+            return min(1.0, max(0.0, 1.0 - s_t / s_c))
 
-        prob = 1.0 - np.exp(- (days_elapsed / scale_lambda) ** shape_rho)
-        return float(np.clip(prob, 0.0, 1.0))
+        return min(1.0, max(0.0, 1.0 - s_t))
 
-    def update_user_scale(self, category: str, recorded_intervals: list[int]) -> float:
-        params = self.get_category_parameters(category)
-        prior_lambda = np.exp(params.get("lambda_intercept", np.log(14.0)))
+    def survival_curve(self, category, per_unit_scale, units, t_values, days_confirmed=None):
+        """Survival probabilities for charting, using exactly the same math as predictions.
 
-        if not recorded_intervals:
-            return float(prior_lambda)
-
-        sample_mean = np.mean(recorded_intervals)
-        n = len(recorded_intervals)
-        pseudo_prior_n = 3.0
-        shrinkage_lambda = (pseudo_prior_n * prior_lambda + n * sample_mean) / (pseudo_prior_n + n)
-        return float(shrinkage_lambda)
+        Before the confirmation date the item is known to be there, so S = 1.
+        """
+        out = []
+        for t in t_values:
+            if days_confirmed and t < days_confirmed:
+                out.append(1.0)
+            else:
+                out.append(1.0 - self.depletion_probability(category, t, per_unit_scale, units, days_confirmed))
+        return out

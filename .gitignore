@@ -7,3 +7,11 @@ pantry.db-wal
 pantry.db-shm
 data/
 *.csv
+.streamlit/secrets.toml
+*.db
+*.db-wal
+*.db-shm
+venv/
+__pycache__/
+.pytest_cache/
+data/*.csv

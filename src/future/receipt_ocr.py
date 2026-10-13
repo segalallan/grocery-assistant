@@ -1,3 +1,7 @@
+# PARKED FOR v2 — receipt OCR. Not imported by the app.
+# Before re-enabling: replace process_receipt_item/mark_item_depleted_manually calls with
+# PantryService.record_purchases(...) so scanned items feed the learning model.
+
 import base64
 import difflib
 import io

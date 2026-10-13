@@ -9,7 +9,9 @@ try:
 except ImportError:
     HAS_LIFELINES = False
 
-DATA_OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "data", "category_priors.json")
+# Writes to a separate file so a run never silently overwrites the curated priors the app uses.
+# Review the output, then copy the entries you want into data/category_priors.json.
+DATA_OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "category_priors.trained.json")
 
 # Sensible domain anchors for household pantry staples
 DEFAULT_CATEGORY_BENCHMARKS = {
@@ -40,12 +42,7 @@ def fit_category_weibull(df_category: pd.DataFrame, category_name: str) -> dict:
         # Calibrated parametric prior when category sample size is small
         med = benchmarks["median_days"]
         rho = benchmarks["rho_target"]
-        return {
-            "lambda_intercept": float(round(np.log(med), 4)),
-            "rho": float(round(rho, 2)),
-            "median_days": float(med),
-            "lambda_beta_units": float(round(benchmarks["beta_units"], 2))
-        }
+        return {"median_days": float(med), "rho": float(round(rho, 2))}
 
     # Prepare training columns
     # Requires columns: 'interval_days', 'units_bought', and optional 'event' (1 = depleted/repurchased)
@@ -66,14 +63,11 @@ def fit_category_weibull(df_category: pd.DataFrame, category_name: str) -> dict:
 
     # Enforce minimum aging floor (rho >= 1.25) to avoid Poisson shopping trip flattening
     final_rho = max(benchmarks["rho_target"], empirical_rho)
-    median_days = float(np.exp(lambda_intercept))
+    # exp(intercept + beta*1) is the Weibull SCALE for one unit; convert to a median for the app.
+    scale_one_unit = float(np.exp(lambda_intercept + lambda_beta_units))
+    median_days = scale_one_unit * np.log(2) ** (1 / final_rho)
 
-    return {
-        "lambda_intercept": float(round(lambda_intercept, 4)),
-        "rho": float(round(final_rho, 2)),
-        "median_days": float(round(median_days, 1)),
-        "lambda_beta_units": float(round(lambda_beta_units, 4))
-    }
+    return {"median_days": float(round(median_days, 1)), "rho": float(round(final_rho, 2))}
 
 def train_and_export_priors(training_csv_path: str = None):
     os.makedirs(os.path.dirname(DATA_OUTPUT_PATH), exist_ok=True)

@@ -1,20 +1,10 @@
-streamlit
-pandas
-numpy
-plotly
-lifelines
-scipy
-pypdfium2
-opencv-python-headless
-Pillow
-streamlit
-pandas
-numpy
-plotly
-lifelines
-scipy
-pypdfium2
-opencv-python-headless
-Pillow
-openai
-openpyxl
+# App (tested with these versions)
+streamlit>=1.65,<2
+pandas>=3.0,<4
+plotly>=7.1,<8
+openai>=3.29,<4
+streamlit-sortables>=0.3.1
+tzdata  # timezone data; required on Windows
+
+# Dev / tests: pip install pytest
+# Research scripts (research/) need: lifelines matplotlib numpy — not installed in production.
