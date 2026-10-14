@@ -90,3 +90,38 @@ def test_hebrew_mode_renders(env):
     at = logged_in(env)
     at.selectbox[0].select("עברית").run()
     assert not at.exception, at.exception
+
+
+def test_signup_then_email_preferences(env):
+    at = fresh_app(env).run()
+    at.text_input(key="su_email").input("new@user.com")
+    at.text_input(key="su_pw").input("password123")
+    first_name = [t for t in at.text_input if t.label == "First name"][0]
+    last_name = [t for t in at.text_input if t.label == "Last name"][0]
+    first_name.input("New"); last_name.input("User")
+    [t for t in at.text_input if t.label.startswith("New household")][0].input("New Home")
+    [b for b in at.button if b.label == "Create Account"][0].click().run()
+    assert not at.exception, at.exception
+    assert at.session_state["onboarding_user_id"]
+
+    at.radio(key="ob_wants").set_value("yes").run()
+    at.radio(key="ob_lang").set_value("he").run()
+    [b for b in at.button if b.label == "Continue"][0].click().run()
+    assert not at.exception, at.exception
+    assert at.session_state["authenticated"] is True
+    user = env.get_user(email="new@user.com")
+    assert user["email_alerts"] == 1 and user["email_lang"] == "he"
+
+
+def test_signup_decline_emails(env):
+    at = fresh_app(env).run()
+    at.text_input(key="su_email").input("no@mail.com")
+    at.text_input(key="su_pw").input("password123")
+    [t for t in at.text_input if t.label == "First name"][0].input("No")
+    [t for t in at.text_input if t.label == "Last name"][0].input("Mail")
+    [t for t in at.text_input if t.label.startswith("New household")][0].input("Quiet Home")
+    [b for b in at.button if b.label == "Create Account"][0].click().run()
+    at.radio(key="ob_wants").set_value("no").run()
+    assert not [r for r in at.radio if r.key == "ob_lang"]  # language only asked after "yes"
+    [b for b in at.button if b.label == "Continue"][0].click().run()
+    assert env.get_user(email="no@mail.com")["email_alerts"] == 0

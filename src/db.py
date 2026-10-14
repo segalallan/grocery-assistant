@@ -56,7 +56,9 @@ _SCHEMA = [
         salt {blob} NOT NULL,
         household_id INTEGER REFERENCES households(id),
         email TEXT,
-        display_name TEXT
+        display_name TEXT,
+        email_alerts INTEGER DEFAULT 1,   -- 1 = wants restock emails
+        email_lang TEXT DEFAULT 'en'      -- 'en' | 'he'
     )""",
     """CREATE TABLE IF NOT EXISTS household_categories (
         id {pk},
@@ -120,6 +122,7 @@ _SCHEMA = [
 
 # Columns added after v1; applied to older databases.
 MIGRATION_COLUMNS = {
+    "users": {"email_alerts": "INTEGER DEFAULT 1", "email_lang": "TEXT DEFAULT 'en'"},
     "inventory": {"item_key": "TEXT", "confirmed_until": "TEXT", "last_alerted": "TEXT"},
     "purchase_history": {"item_key": "TEXT", "units": "INTEGER", "kind": "TEXT"},
     "purchases": {"item_key": "TEXT"},
@@ -359,13 +362,7 @@ class Database:
         """Returns the user's profile dict on success, else None."""
         email = email.strip().lower()
         with self.connect() as conn:
-            row = conn.execute(
-                """SELECT u.id, u.username, u.display_name, u.household_id, u.email,
-                          u.password_hash, u.salt, h.name AS household_name, h.household_code
-                   FROM users u LEFT JOIN households h ON u.household_id = h.id
-                   WHERE u.username = ?""",
-                (email,),
-            ).fetchone()
+            row = conn.execute(self._PROFILE_SQL + " WHERE u.username = ?", (email,)).fetchone()
         if not row:
             _hash_password(password, b"\x00" * 16)  # keep timing similar for unknown emails
             return None
@@ -375,6 +372,39 @@ class Database:
         user.pop("password_hash")
         user.pop("salt")
         return user
+
+    _PROFILE_SQL = """SELECT u.id, u.username, u.display_name, u.household_id, u.email,
+                             u.password_hash, u.salt, u.email_alerts, u.email_lang,
+                             h.name AS household_name, h.household_code
+                      FROM users u LEFT JOIN households h ON u.household_id = h.id"""
+
+    def get_user(self, user_id: int = None, email: str = None):
+        """Profile dict (no password fields) by id or email, or None."""
+        with self.connect() as conn:
+            if user_id is not None:
+                row = conn.execute(self._PROFILE_SQL + " WHERE u.id = ?", (user_id,)).fetchone()
+            else:
+                row = conn.execute(self._PROFILE_SQL + " WHERE u.username = ?",
+                                   ((email or "").strip().lower(),)).fetchone()
+        if not row:
+            return None
+        user = {k: row[k] for k in row.keys()}
+        user.pop("password_hash")
+        user.pop("salt")
+        return user
+
+    def get_email_prefs(self, user_id: int) -> dict:
+        with self.connect() as conn:
+            row = conn.execute("SELECT email_alerts, email_lang FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            return {"enabled": True, "lang": "en"}
+        return {"enabled": row["email_alerts"] != 0, "lang": row["email_lang"] or "en"}
+
+    def set_email_prefs(self, user_id: int, enabled: bool, lang: str):
+        lang = lang if lang in ("en", "he") else "en"
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET email_alerts = ?, email_lang = ? WHERE id = ?",
+                         (1 if enabled else 0, lang, user_id))
 
     def change_password(self, user_id: int, current_password: str, new_password: str) -> bool:
         """Only for a logged-in user who knows their current password."""

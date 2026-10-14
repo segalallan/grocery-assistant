@@ -139,10 +139,34 @@ def render_auth_view():
                 else:
                     ok, err = db.create_user(email, password, first, last, house_name, join_code or None)
                     if ok:
-                        st.success(tr("signup_ok"))
+                        st.session_state["onboarding_user_id"] = db.get_user(email=email)["id"]
+                        st.rerun()
                     else:
                         st.error(err)
 
+
+def render_email_onboarding(user_id: int):
+    """Shown once, right after a successful signup."""
+    st.title(tr("title"))
+    st.success(tr("signup_done"))
+    st.subheader(tr("email_q_title"))
+    wants = st.radio(tr("email_q"), ["yes", "no"], horizontal=True, key="ob_wants",
+                     format_func=lambda x: tr(f"answer_{x}"))
+    lang = "en"
+    if wants == "yes":
+        lang = st.radio(tr("email_lang_q"), ["en", "he"], horizontal=True, key="ob_lang",
+                        format_func=lambda x: "English" if x == "en" else "עברית")
+    if st.button(tr("continue_btn"), type="primary"):
+        db.set_email_prefs(user_id, wants == "yes", lang)
+        user = db.get_user(user_id=user_id)
+        st.session_state.pop("onboarding_user_id", None)
+        login(user)
+        st.rerun()
+
+
+if st.session_state.get("onboarding_user_id"):
+    render_email_onboarding(st.session_state["onboarding_user_id"])
+    st.stop()
 
 if not st.session_state.get("authenticated"):
     render_auth_view()
@@ -162,6 +186,16 @@ with head_l:
     st.markdown(f"👤 **{display_name}** · 🏠 **{household_name}** · {tr('invite')} `{st.session_state['household_code']}`")
 with head_r:
     with st.popover(tr("account"), width="stretch"):
+        prefs = db.get_email_prefs(st.session_state["user_id"])
+        with st.form("email_prefs"):
+            st.markdown(f"**{tr('email_settings')}**")
+            p_on = st.toggle(tr("email_toggle"), value=prefs["enabled"])
+            p_lang = st.radio(tr("email_lang_q"), ["en", "he"], horizontal=True,
+                              index=0 if prefs["lang"] == "en" else 1,
+                              format_func=lambda x: "English" if x == "en" else "עברית")
+            if st.form_submit_button(tr("save_btn")):
+                db.set_email_prefs(st.session_state["user_id"], p_on, p_lang)
+                st.success(tr("email_saved"))
         with st.form("change_pw"):
             cur_pw = st.text_input(tr("current_pw"), type="password")
             new_pw = st.text_input(tr("new_pw"), type="password")

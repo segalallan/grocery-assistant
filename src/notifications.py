@@ -1,7 +1,13 @@
 """Daily restock emails. Runs headless (no Streamlit needed) — see jobs/send_alerts.py.
 
-Each stock row is emailed about once: after an alert it's stamped `last_alerted`,
-and that stamp is cleared by "still going" (or replaced by a new purchase row).
+Every morning, each member who opted in gets one email listing every item in their
+household that is at or above the restock threshold and not already on the shopping list.
+An item keeps appearing each day until someone acts on it ("Ran out", "Still have it",
+adding it to the list, or buying it again).
+
+Language is per member: English emails use English item names, Hebrew emails are
+right-to-left and use Hebrew item names (falling back to the other name when one is missing).
+`last_alerted` records the last day an item was included in an email.
 """
 import html
 import logging
@@ -13,6 +19,25 @@ from config import RESTOCK_THRESHOLD, get_secret
 
 log = logging.getLogger(__name__)
 
+TEXT = {
+    "en": {
+        "dir": "ltr", "align": "left",
+        "title": "Smart Pantry: Restock Alert",
+        "intro": "These items in <b>{household}</b> are probably running out:",
+        "col_item": "Item", "col_risk": "Chance it's gone", "col_days": "Days since purchase",
+        "footer": "Open the app to add them to your shopping list or mark them as still going.",
+        "subject": "Pantry alert: {n} item(s) running low in {household}",
+    },
+    "he": {
+        "dir": "rtl", "align": "right",
+        "title": "המזווה החכם: התראת מלאי",
+        "intro": "הפריטים האלה ב<b>{household}</b> כנראה עומדים להיגמר:",
+        "col_item": "פריט", "col_risk": "סיכוי שנגמר", "col_days": "ימים מאז הקנייה",
+        "footer": "היכנסו לאפליקציה כדי להוסיף אותם לרשימת הקניות או לסמן שעדיין יש.",
+        "subject": "התראת מזווה: {n} פריטים עומדים להיגמר ב{household}",
+    },
+}
+
 
 def _smtp_credentials():
     sender = get_secret("EMAIL_SENDER", "GMAIL_USER")
@@ -22,72 +47,81 @@ def _smtp_credentials():
     return sender, password
 
 
-def build_alert_html(household_name: str, items: list[dict]) -> str:
+def item_name(item: dict, lang: str) -> str:
+    if lang == "he":
+        return item["name_he"] or item["name_en"]
+    return item["name_en"] or item["name_he"]
+
+
+def build_alert_html(household_name: str, items: list[dict], lang: str = "en") -> str:
+    t = TEXT.get(lang, TEXT["en"])
+    cell = f"padding:8px;border:1px solid #ddd;text-align:{t['align']};"
     rows = "".join(
         f"""<tr>
-              <td style="padding:8px;border:1px solid #ddd;"><b>{html.escape(str(it['name']))}</b></td>
-              <td style="padding:8px;border:1px solid #ddd;color:#d9534f;"><b>{int(it['risk'] * 100)}%</b></td>
-              <td style="padding:8px;border:1px solid #ddd;">{int(it['days'])}</td>
+              <td style="{cell}"><b>{html.escape(str(it['name']))}</b></td>
+              <td style="{cell}color:#d9534f;"><b>{int(it['risk'] * 100)}%</b></td>
+              <td style="{cell}">{int(it['days'])}</td>
             </tr>"""
         for it in items
     )
     return f"""
-    <div style="font-family:Arial,sans-serif;color:#333;">
-      <h2 style="color:#1B365D;">Smart Pantry: Restock Alert</h2>
-      <p>These items in <b>{html.escape(household_name)}</b> are probably running out:</p>
-      <table style="width:100%;border-collapse:collapse;margin-top:10px;">
-        <tr style="background:#f4f4f4;text-align:left;">
-          <th style="padding:8px;border:1px solid #ddd;">Item</th>
-          <th style="padding:8px;border:1px solid #ddd;">Chance it's gone</th>
-          <th style="padding:8px;border:1px solid #ddd;">Days since purchase</th>
+    <div dir="{t['dir']}" style="font-family:Arial,sans-serif;color:#333;text-align:{t['align']};">
+      <h2 style="color:#1B365D;">{t['title']}</h2>
+      <p>{t['intro'].format(household=html.escape(household_name))}</p>
+      <table dir="{t['dir']}" style="width:100%;border-collapse:collapse;margin-top:10px;">
+        <tr style="background:#f4f4f4;">
+          <th style="{cell}">{t['col_item']}</th>
+          <th style="{cell}">{t['col_risk']}</th>
+          <th style="{cell}">{t['col_days']}</th>
         </tr>
         {rows}
       </table>
-      <p style="margin-top:20px;">Open the app to add them to your shopping list or mark them as still going.</p>
+      <p style="margin-top:20px;">{t['footer']}</p>
     </div>"""
 
 
-def send_alert_email(server, sender, recipient, household_name, items):
+def send_alert_email(server, sender, recipient, household_name, items, lang="en"):
+    t = TEXT.get(lang, TEXT["en"])
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"Pantry alert: {len(items)} item(s) running low in {household_name}"
+    msg["Subject"] = t["subject"].format(n=len(items), household=household_name)
     msg["From"] = sender
     msg["To"] = recipient
-    msg.attach(MIMEText(build_alert_html(household_name, items), "html", "utf-8"))
+    msg.attach(MIMEText(build_alert_html(household_name, items, lang), "html", "utf-8"))
     refused = server.sendmail(sender, [recipient], msg.as_string())
     if refused:
         raise RuntimeError(f"Recipient refused: {refused}")
 
 
 def process_all_daily_alerts(service, dry_run: bool = False) -> dict:
-    """Emails every member of each household about newly high-risk items.
+    """Emails every opted-in member about their household's high-risk items.
 
     Returns a summary dict. With dry_run=True nothing is sent or stamped.
     """
     with service.db.connect() as conn:
         members = [dict(r) for r in conn.execute(
             """SELECT u.household_id, COALESCE(NULLIF(u.email, ''), u.username) AS email,
+                      COALESCE(u.email_lang, 'en') AS lang,
                       COALESCE(h.name, 'Your Household') AS household_name
                FROM users u JOIN households h ON u.household_id = h.id
-               WHERE COALESCE(NULLIF(u.email, ''), u.username) LIKE '%@%'""")]
+               WHERE COALESCE(u.email_alerts, 1) != 0
+                 AND COALESCE(NULLIF(u.email, ''), u.username) LIKE '%@%'""")]
 
     by_household: dict[int, dict] = {}
     for m in members:
-        hh = by_household.setdefault(m["household_id"], {"name": m["household_name"], "emails": []})
-        hh["emails"].append(m["email"].strip())
+        hh = by_household.setdefault(m["household_id"], {"name": m["household_name"], "members": []})
+        hh["members"].append((m["email"].strip(), m["lang"] if m["lang"] in TEXT else "en"))
 
     summary = {"households": 0, "emails_sent": 0, "items_alerted": 0, "errors": []}
-    server = None
+    server = sender = None
     try:
         for hh_id, hh in by_household.items():
-            pantry = service.get_pantry(hh_id)
-            fresh = [i for i in service.restock_candidates(pantry, RESTOCK_THRESHOLD) if not i["last_alerted"]]
-            if not fresh:
+            due = service.restock_candidates(service.get_pantry(hh_id), RESTOCK_THRESHOLD)
+            if not due:
                 continue
             summary["households"] += 1
-            items = [{"name": i["name_en"] or i["name_he"], "risk": i["prob_depleted"], "days": i["days_elapsed"]}
-                     for i in fresh]
             if dry_run:
-                log.info("[dry run] %s: %s", hh["name"], [i["name"] for i in items])
+                log.info("[dry run] %s → %s: %s", hh["name"], [e for e, _ in hh["members"]],
+                         [item_name(i, "en") for i in due])
                 continue
 
             if server is None:
@@ -96,17 +130,19 @@ def process_all_daily_alerts(service, dry_run: bool = False) -> dict:
                 server.login(sender, password)
 
             sent_any = False
-            for email in hh["emails"]:
+            for email, lang in hh["members"]:
+                items = [{"name": item_name(i, lang), "risk": i["prob_depleted"], "days": i["days_elapsed"]}
+                         for i in due]
                 try:
-                    send_alert_email(server, sender, email, hh["name"], items)
+                    send_alert_email(server, sender, email, hh["name"], items, lang)
                     summary["emails_sent"] += 1
                     sent_any = True
                 except Exception as e:
                     summary["errors"].append(f"{email}: {e}")
                     log.warning("Alert to %s failed: %s", email, e)
             if sent_any:
-                service.mark_alerted(hh_id, [i["id"] for i in fresh])
-                summary["items_alerted"] += len(fresh)
+                service.mark_alerted(hh_id, [i["id"] for i in due])
+                summary["items_alerted"] += len(due)
     finally:
         if server is not None:
             try:
