@@ -16,3 +16,5 @@ venv/
 .venv/
 __pycache__/
 .pytest_cache/
+
+**/secrets.toml
