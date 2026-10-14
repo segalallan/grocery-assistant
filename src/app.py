@@ -13,9 +13,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import DB_PATH, today as app_today
+from db import RESET_CODE_MINUTES
 from db import Database
 from engine import PantryDepletionEngine
 from i18n import make_translator
+from notifications import send_reset_email
 from pantry_service import PantryService
 from text_parser import TextListParser
 
@@ -101,9 +103,11 @@ def logout():
 def render_auth_view():
     st.title(tr("title"))
     st.subheader(tr("login_sub"))
-    tab_login, tab_signup = st.tabs([tr("tab_login"), tr("tab_signup")])
+    tab_login, tab_signup, tab_reset = st.tabs([tr("tab_login"), tr("tab_signup"), tr("tab_reset")])
 
     with tab_login:
+        if st.session_state.pop("reset_done", False):
+            st.success(tr("reset_ok"))
         with st.form("login_form"):
             email = st.text_input(tr("email")).strip().lower()
             password = st.text_input(tr("password"), type="password")
@@ -114,7 +118,6 @@ def render_auth_view():
                     st.rerun()
                 else:
                     st.error(tr("err_creds"))
-        st.caption(tr("forgot_pw"))
 
     with tab_signup:
         with st.form("signup_form"):
@@ -143,6 +146,58 @@ def render_auth_view():
                         st.rerun()
                     else:
                         st.error(err)
+
+
+    with tab_reset:
+        render_password_reset()
+
+
+def render_password_reset():
+    """Step 1: email → code is emailed. Step 2: code + new password."""
+    reset_email = st.session_state.get("reset_email")
+
+    if not reset_email:
+        with st.form("reset_request"):
+            st.write(tr("reset_intro"))
+            email = st.text_input(tr("email"), key="reset_email_input").strip().lower()
+            if st.form_submit_button(tr("reset_send_btn"), type="primary"):
+                if not EMAIL_RE.match(email):
+                    st.error(tr("err_email"))
+                else:
+                    result = db.create_reset_code(email)
+                    if result["status"] == "ok":
+                        lang = st.session_state.get("lang", "en")
+                        try:
+                            send_reset_email(email, result["code"], lang, RESET_CODE_MINUTES)
+                        except Exception:
+                            log.exception("Password reset email failed")
+                            st.error(tr("reset_send_failed"))
+                            return
+                    # Same outcome whether or not the email has an account.
+                    st.session_state["reset_email"] = email
+                    st.rerun()
+        return
+
+    st.info(tr("reset_sent", email=reset_email))
+    with st.form("reset_confirm"):
+        code = st.text_input(tr("reset_code"), max_chars=6, key="reset_code_input").strip()
+        new_pw = st.text_input(tr("new_pw"), type="password", key="reset_pw1")
+        new_pw2 = st.text_input(tr("confirm_pw"), type="password", key="reset_pw2")
+        if st.form_submit_button(tr("reset_confirm_btn"), type="primary"):
+            if len(new_pw) < 8:
+                st.error(tr("err_pw_short"))
+            elif new_pw != new_pw2:
+                st.error(tr("pw_mismatch"))
+            else:
+                ok, reason = db.reset_password_with_code(reset_email, code, new_pw)
+                if ok:
+                    st.session_state.pop("reset_email", None)
+                    st.session_state["reset_done"] = True
+                    st.rerun()
+                st.error(tr(f"reset_{reason}"))
+    if st.button(tr("reset_start_over")):
+        st.session_state.pop("reset_email", None)
+        st.rerun()
 
 
 def render_email_onboarding(user_id: int):

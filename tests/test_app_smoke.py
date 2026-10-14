@@ -125,3 +125,47 @@ def test_signup_decline_emails(env):
     assert not [r for r in at.radio if r.key == "ob_lang"]  # language only asked after "yes"
     [b for b in at.button if b.label == "Continue"][0].click().run()
     assert env.get_user(email="no@mail.com")["email_alerts"] == 0
+
+
+def test_forgot_password_flow(env, monkeypatch):
+    import notifications
+    sent = []
+
+    class FakeSMTP:
+        def __init__(self, *a, **k): pass
+        def login(self, *a): pass
+        def sendmail(self, s, to, msg): sent.append(msg); return {}
+        def quit(self): pass
+
+    monkeypatch.setattr(notifications.smtplib, "SMTP_SSL", FakeSMTP)
+    monkeypatch.setenv("EMAIL_SENDER", "bot@x.com")
+    monkeypatch.setenv("EMAIL_PASSWORD", "pw")
+
+    at = fresh_app(env).run()
+    at.text_input(key="reset_email_input").input("a@b.com")
+    [b for b in at.button if b.label == "Send code"][0].click().run()
+    assert not at.exception, at.exception
+    assert len(sent) == 1
+
+    import email, re
+    m = email.message_from_string(sent[0])
+    body = next(p for p in m.walk() if p.get_content_type() == "text/html").get_payload(decode=True).decode()
+    code = re.search(r">(\d{6})<", body).group(1)
+
+    at.text_input(key="reset_code_input").input(code)
+    at.text_input(key="reset_pw1").input("brandnew123")
+    at.text_input(key="reset_pw2").input("brandnew123")
+    [b for b in at.button if b.label == "Set new password"][0].click().run()
+    assert not at.exception, at.exception
+    assert any("Password changed" in s.value for s in at.success)
+    assert env.authenticate("a@b.com", "brandnew123")
+
+
+def test_forgot_password_unknown_email_looks_the_same(env, monkeypatch):
+    import notifications
+    monkeypatch.setattr(notifications.smtplib, "SMTP_SSL", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no email")))
+    at = fresh_app(env).run()
+    at.text_input(key="reset_email_input").input("stranger@x.com")
+    [b for b in at.button if b.label == "Send code"][0].click().run()
+    assert not at.exception, at.exception
+    assert any("If stranger@x.com has an account" in i.value for i in at.info)

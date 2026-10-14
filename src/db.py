@@ -15,14 +15,19 @@ import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 from config import DB_PATH, DEFAULT_CATEGORIES, get_secret
 
 log = logging.getLogger(__name__)
 PBKDF2_ITERATIONS = 260_000
 
+RESET_CODE_MINUTES = 15      # how long an emailed code stays valid
+RESET_MAX_ATTEMPTS = 5       # wrong guesses before the code is burned
+RESET_RESEND_SECONDS = 60    # minimum gap between codes for the same account
+
 TABLES = ["households", "users", "household_categories", "inventory",
-          "purchase_history", "purchases", "shopping_list"]  # dependency order
+          "purchase_history", "purchases", "shopping_list", "password_resets"]  # dependency order
 
 
 def normalize_key(name_en: str | None, name_he: str | None = None) -> str:
@@ -105,6 +110,15 @@ _SCHEMA = [
         purchase_date TEXT,
         recorded_by TEXT,
         recorded_at TEXT
+    )""",
+    # One pending reset code per user (stored hashed, never in plain text).
+    """CREATE TABLE IF NOT EXISTS password_resets (
+        id {pk},
+        user_id INTEGER REFERENCES users(id),
+        code_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,   -- ISO UTC timestamp
+        expires_at TEXT NOT NULL,   -- ISO UTC timestamp
+        attempts INTEGER DEFAULT 0
     )""",
     """CREATE TABLE IF NOT EXISTS shopping_list (
         id {pk},
@@ -405,6 +419,60 @@ class Database:
         with self.connect() as conn:
             conn.execute("UPDATE users SET email_alerts = ?, email_lang = ? WHERE id = ?",
                          (1 if enabled else 0, lang, user_id))
+
+    # ---------- password reset ----------
+    @staticmethod
+    def _reset_hash(user_id: int, code: str) -> str:
+        return hashlib.sha256(f"{user_id}:{code.strip()}".encode()).hexdigest()
+
+    def create_reset_code(self, email: str, now: datetime | None = None) -> dict:
+        """Make a fresh 6-digit code for this email.
+
+        Returns {"status": "ok", "code", "user"} | {"status": "unknown"} | {"status": "cooldown"}.
+        The UI must show the same message for every status so it never reveals who has an account.
+        """
+        now = now or datetime.now(timezone.utc)
+        user = self.get_user(email=email)
+        if not user:
+            return {"status": "unknown"}
+        with self.connect() as conn:
+            last = conn.execute("SELECT created_at FROM password_resets WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                                (user["id"],)).fetchone()
+            if last and (now - datetime.fromisoformat(last["created_at"])).total_seconds() < RESET_RESEND_SECONDS:
+                return {"status": "cooldown"}
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            conn.execute("DELETE FROM password_resets WHERE user_id = ?", (user["id"],))
+            conn.execute(
+                "INSERT INTO password_resets (user_id, code_hash, created_at, expires_at, attempts) VALUES (?, ?, ?, ?, 0)",
+                (user["id"], self._reset_hash(user["id"], code), now.isoformat(),
+                 (now + timedelta(minutes=RESET_CODE_MINUTES)).isoformat()))
+        return {"status": "ok", "code": code, "user": user}
+
+    def reset_password_with_code(self, email: str, code: str, new_password: str,
+                                 now: datetime | None = None) -> tuple[bool, str]:
+        """Returns (ok, reason). reason: 'ok' | 'invalid' | 'expired' | 'locked'."""
+        now = now or datetime.now(timezone.utc)
+        user = self.get_user(email=email)
+        if not user:
+            return False, "invalid"
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM password_resets WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                               (user["id"],)).fetchone()
+            if not row:
+                return False, "invalid"
+            if row["attempts"] >= RESET_MAX_ATTEMPTS:
+                return False, "locked"
+            if now > datetime.fromisoformat(row["expires_at"]):
+                conn.execute("DELETE FROM password_resets WHERE user_id = ?", (user["id"],))
+                return False, "expired"
+            if not hmac.compare_digest(self._reset_hash(user["id"], code), row["code_hash"]):
+                conn.execute("UPDATE password_resets SET attempts = attempts + 1 WHERE id = ?", (row["id"],))
+                return False, ("locked" if row["attempts"] + 1 >= RESET_MAX_ATTEMPTS else "invalid")
+            salt = os.urandom(16)
+            conn.execute("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?",
+                         (_hash_password(new_password, salt), salt, user["id"]))
+            conn.execute("DELETE FROM password_resets WHERE user_id = ?", (user["id"],))
+        return True, "ok"
 
     def change_password(self, user_id: int, current_password: str, new_password: str) -> bool:
         """Only for a logged-in user who knows their current password."""

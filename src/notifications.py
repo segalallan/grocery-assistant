@@ -92,6 +92,45 @@ def send_alert_email(server, sender, recipient, household_name, items, lang="en"
         raise RuntimeError(f"Recipient refused: {refused}")
 
 
+RESET_TEXT = {
+    "en": {"dir": "ltr", "subject": "Your Smart Pantry password reset code",
+           "title": "Password reset", "intro": "Use this code to set a new password:",
+           "footer": "The code is valid for {minutes} minutes. If you didn't ask for it, you can ignore this email."},
+    "he": {"dir": "rtl", "subject": "קוד לאיפוס הסיסמה במזווה החכם",
+           "title": "איפוס סיסמה", "intro": "השתמשו בקוד הזה כדי לבחור סיסמה חדשה:",
+           "footer": "הקוד בתוקף ל-{minutes} דקות. אם לא ביקשתם אותו, אפשר להתעלם מהמייל."},
+}
+
+
+def send_reset_email(recipient: str, code: str, lang: str = "en", minutes: int = 15):
+    """Sends the reset code. Raises on failure so the UI can say so."""
+    t = RESET_TEXT.get(lang, RESET_TEXT["en"])
+    sender, password = _smtp_credentials()
+    body = f"""
+    <div dir="{t['dir']}" style="font-family:Arial,sans-serif;color:#333;">
+      <h2 style="color:#1B365D;">{t['title']}</h2>
+      <p>{t['intro']}</p>
+      <p style="font-size:32px;font-weight:bold;letter-spacing:6px;" dir="ltr">{html.escape(code)}</p>
+      <p style="color:#666;">{t['footer'].format(minutes=minutes)}</p>
+    </div>"""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = t["subject"]
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.attach(MIMEText(body, "html", "utf-8"))
+    server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30)
+    try:
+        server.login(sender, password)
+        refused = server.sendmail(sender, [recipient], msg.as_string())
+        if refused:
+            raise RuntimeError(f"Recipient refused: {refused}")
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+
+
 def process_all_daily_alerts(service, dry_run: bool = False) -> dict:
     """Emails every opted-in member about their household's high-risk items.
 
