@@ -54,10 +54,10 @@ _CSS = f"""
 /* Hide Streamlit's running-man icon and "Stop" button. */
 [data-testid="stStatusWidget"] {{ visibility: hidden; }}
 
-/* While the app is working, show the rolling cart in a small card at the top centre. */
+/* While the app is working, show the rolling cart in a card in the middle of the screen. */
 .stApp:has([data-testid="stStatusWidget"])::after {{
   content: "";
-  position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
   width: {SIZE + 24}px; height: {int(SIZE * 2 / 3) + 16}px; z-index: 1000002;
   background: #fff url("{_CART_URI}") center / {SIZE}px auto no-repeat;
   border-radius: 14px; box-shadow: 0 4px 18px rgba(0,0,0,.12);

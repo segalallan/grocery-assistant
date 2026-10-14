@@ -72,7 +72,7 @@ def test_add_purchase_and_full_dashboard(env):
 
     # Ran Out via bulk action
     milk_chk = next(c for c in at.checkbox if c.key and c.key.startswith("chk_"))
-    milk_chk.check().run()
+    milk_chk.check()  # inside the form: nothing runs until an action is pressed
     ran_out = next(b for b in at.button if b.label == "❌ Ran out")
     ran_out.click().run()
     assert not at.exception, at.exception
@@ -169,3 +169,17 @@ def test_forgot_password_unknown_email_looks_the_same(env, monkeypatch):
     [b for b in at.button if b.label == "Send code"][0].click().run()
     assert not at.exception, at.exception
     assert any("If stranger@x.com has an account" in i.value for i in at.info)
+
+
+def test_action_without_selection_warns(env):
+    from config import today
+    from engine import PantryDepletionEngine
+    from pantry_service import PantryService
+    svc = PantryService(env, PantryDepletionEngine())
+    hh = env.authenticate("a@b.com", "password1")["household_id"]
+    svc.record_purchase(hh, "Rice", "", "Pantry Staples", 1, today(), "Avi")
+    at = logged_in(env)
+    next(b for b in at.button if b.label == "❌ Ran out").click().run()
+    assert not at.exception, at.exception
+    assert any("Select at least one" in w.value for w in at.warning)
+    assert len(svc.get_pantry(hh)) == 1

@@ -61,9 +61,9 @@ db = svc.db
 engine = svc.engine
 
 
-def clear_keys(prefix: str):
-    for k in [k for k in st.session_state if str(k).startswith(prefix)]:
-        del st.session_state[k]
+def reset_selection():
+    """Untick every pantry item (new widget keys = fresh, unticked checkboxes)."""
+    st.session_state["sel_ver"] = st.session_state.get("sel_ver", 0) + 1
 
 
 # ==========================================================================
@@ -304,27 +304,50 @@ candidates = svc.restock_candidates(pantry_all)
 def restock_dialog(items):
     st.subheader(tr("restock_title"))
     st.caption(tr("restock_help"))
-    with st.container(height=320, border=True):
-        for it in items:
-            c1, c2, c3 = st.columns([0.12, 0.66, 0.22])
-            c1.checkbox(" ", key=f"restk_{it['id']}", label_visibility="collapsed")
-            c2.markdown(f"**{it['display_name']}**  \n:gray[{it['category_display']} · {it['days_elapsed']}d]")
-            c3.markdown(f"🚨 **{int(it['prob_depleted'] * 100)}%**")
+    rv = st.session_state.get("restk_ver", 0)
+    # Inside a form, ticking boxes doesn't rerun the app; only the action buttons do.
+    with st.form("restock_form", border=False):
+        with st.container(height=320, border=True):
+            for it in items:
+                c1, c2, c3 = st.columns([0.12, 0.66, 0.22])
+                c1.checkbox(" ", key=f"restk_{rv}_{it['id']}", label_visibility="collapsed")
+                c2.markdown(f"**{it['display_name']}**  \n:gray[{it['category_display']} · {it['days_elapsed']}d]")
+                c3.markdown(f"🚨 **{int(it['prob_depleted'] * 100)}%**")
+        b1, b2, b3 = st.columns(3)
+        do_add = b1.form_submit_button(tr("add_to_list"), type="primary", width="stretch")
+        do_still = b2.form_submit_button(tr("still_going"), width="stretch")
+        do_out = b3.form_submit_button(tr("ran_out"), width="stretch")
 
-    chosen = [it for it in items if st.session_state.get(f"restk_{it['id']}")]
-    b1, b2, b3 = st.columns(3)
-    if b1.button(tr("add_to_list"), type="primary", disabled=not chosen, width="stretch"):
-        svc.add_to_shopping_list(household_id, chosen, "smart_alert", display_name, today)
-        clear_keys("restk_")
+    if do_add or do_still or do_out:
+        chosen = [it for it in items if st.session_state.get(f"restk_{rv}_{it['id']}")]
+        if not chosen:
+            st.warning(tr("select_first"))
+            return
+        ids = [i["id"] for i in chosen]
+        if do_add:
+            svc.add_to_shopping_list(household_id, chosen, "smart_alert", display_name, today)
+        elif do_still:
+            svc.mark_still_going(household_id, ids, today)
+        else:
+            svc.mark_depleted(household_id, ids, today, display_name)
+        st.session_state["restk_ver"] = rv + 1
         st.rerun()
-    if b2.button(tr("still_going"), disabled=not chosen, width="stretch"):
-        svc.mark_still_going(household_id, [i["id"] for i in chosen], today)
-        clear_keys("restk_")
-        st.rerun()
-    if b3.button(tr("ran_out"), disabled=not chosen, width="stretch"):
-        svc.mark_depleted(household_id, [i["id"] for i in chosen], today, display_name)
-        clear_keys("restk_")
-        st.rerun()
+
+
+@st.dialog("✏️")
+def edit_dialog(it):
+    st.markdown(f"**{tr('edit')}**")
+    with st.form(f"edit_{it['id']}", border=False):
+        e_en = st.text_input(tr("item_name_en"), value=it["name_en"] or "")
+        e_he = st.text_input(tr("item_name_he"), value=it["name_he"] or "")
+        e_qty = st.number_input(tr("units"), min_value=1, value=int(it["units"]), step=1)
+        opts = cat_options_with(it["category"])
+        e_cat = st.selectbox(tr("category"), opts, format_func=cat_fmt,
+                             index=opts.index(it["category"]) if it["category"] in opts else 0)
+        if st.form_submit_button(tr("update_btn"), type="primary"):
+            svc.update_item(household_id, it["id"], e_en, e_he, e_cat, e_qty)
+            reset_selection()
+            st.rerun()
 
 
 @st.dialog("🔀")
@@ -337,7 +360,7 @@ def merge_dialog(selected):
                         format_func=lambda x: f"{x['display_name']} ×{x['units']} ({x['category_display']})")
     if st.button("Confirm merge", type="primary"):
         svc.merge_items(household_id, keep["id"], [i["id"] for i in selected])
-        clear_keys("chk_")
+        reset_selection()
         st.rerun()
 
 
@@ -401,57 +424,61 @@ with tab_pantry:
         }
         items.sort(key=sorters[sort_by], reverse=(sort_by == "date"))
 
-        selected = [i for i in items if st.session_state.get(f"chk_{i['id']}")]
-        if selected:
-            ids = [i["id"] for i in selected]
-            st.markdown(f"**{tr('selected_n', n=len(selected))}**")
-            b = st.columns(5)
-            if b[0].button(tr("ran_out"), width="stretch"):
-                svc.mark_depleted(household_id, ids, today, display_name)
-                clear_keys("chk_"); st.rerun()
-            if b[1].button(tr("still_going"), width="stretch"):
-                svc.mark_still_going(household_id, ids, today)
-                clear_keys("chk_"); st.rerun()
-            if b[2].button(tr("add_to_list"), width="stretch"):
-                svc.add_to_shopping_list(household_id, selected, "manual", display_name, today)
-                clear_keys("chk_"); st.rerun()
-            if b[3].button(tr("merge"), width="stretch"):
-                merge_dialog(selected)
-            if b[4].button(tr("delete"), width="stretch", help="Remove a mistaken entry (doesn't teach the model)"):
-                svc.delete_items(household_id, ids)
-                clear_keys("chk_"); st.rerun()
-            st.divider()
+        sel_ver = st.session_state.setdefault("sel_ver", 0)
+        # The list is a form: ticking items is instant and runs nothing.
+        # The app only runs when one of the action buttons is pressed.
+        with st.form("pantry_select", border=False):
+            with st.container(horizontal=True):
+                act_out = st.form_submit_button(tr("ran_out"))
+                act_still = st.form_submit_button(tr("still_going"))
+                act_list = st.form_submit_button(tr("add_to_list"))
+                act_edit = st.form_submit_button(tr("edit_btn"))
+                act_merge = st.form_submit_button(tr("merge"))
+                act_del = st.form_submit_button(tr("delete"),
+                                                help="Remove a mistaken entry (doesn't teach the model)")
+            st.caption(tr("select_hint"))
 
-        for it in items:
-            c_chk, c1, c2, c_edit = st.columns([0.4, 3.4, 2.6, 0.6])
-            c_chk.checkbox(" ", key=f"chk_{it['id']}", label_visibility="collapsed")
-            with c1:
-                qty = f" ×{it['units']}" if it["units"] > 1 else ""
-                badges = []
-                if it["on_shopping_list"]:
-                    badges.append(tr("on_list_badge"))
-                if it["confirmed_until"]:
-                    badges.append(tr("confirmed_badge", date=it["confirmed_until"]))
-                st.markdown(f"**{it['display_name']}**{qty}  " + ("  ".join(f":blue-badge[{b}]" for b in badges)))
-                st.caption(f"🏷️ {it['category_display']} · {it['purchase_date']} ({it['days_elapsed']}d) · "
-                           + tr("lasts", d=round(it["effective_scale"])))
-            with c2:
-                p = it["prob_depleted"]
-                st.progress(p)
-                st.caption(f"{tr('depletion_risk')}: **{int(p * 100)}%**")
-            with c_edit:
-                with st.popover("✏️"):
-                    with st.form(f"edit_{it['id']}"):
-                        st.markdown(f"**{tr('edit')}**")
-                        e_en = st.text_input(tr("item_name_en"), value=it["name_en"] or "")
-                        e_he = st.text_input(tr("item_name_he"), value=it["name_he"] or "")
-                        e_qty = st.number_input(tr("units"), min_value=1, value=int(it["units"]), step=1)
-                        opts = cat_options_with(it["category"])
-                        e_cat = st.selectbox(tr("category"), opts, format_func=cat_fmt,
-                                             index=opts.index(it["category"]) if it["category"] in opts else 0)
-                        if st.form_submit_button(tr("update_btn")):
-                            svc.update_item(household_id, it["id"], e_en, e_he, e_cat, e_qty)
-                            st.rerun()
+            for it in items:
+                c_chk, c1, c2 = st.columns([0.4, 3.8, 2.8])
+                c_chk.checkbox(" ", key=f"chk_{sel_ver}_{it['id']}", label_visibility="collapsed")
+                with c1:
+                    qty = f" ×{it['units']}" if it["units"] > 1 else ""
+                    badges = []
+                    if it["on_shopping_list"]:
+                        badges.append(tr("on_list_badge"))
+                    if it["confirmed_until"]:
+                        badges.append(tr("confirmed_badge", date=it["confirmed_until"]))
+                    st.markdown(f"**{it['display_name']}**{qty}  " + ("  ".join(f":blue-badge[{b}]" for b in badges)))
+                    st.caption(f"🏷️ {it['category_display']} · {it['purchase_date']} ({it['days_elapsed']}d) · "
+                               + tr("lasts", d=round(it["effective_scale"])))
+                with c2:
+                    p = it["prob_depleted"]
+                    st.progress(p)
+                    st.caption(f"{tr('depletion_risk')}: **{int(p * 100)}%**")
+
+        if any([act_out, act_still, act_list, act_edit, act_merge, act_del]):
+            selected = [i for i in items if st.session_state.get(f"chk_{sel_ver}_{i['id']}")]
+            ids = [i["id"] for i in selected]
+            if not selected:
+                st.warning(tr("select_first"))
+            elif act_edit:
+                if len(selected) == 1:
+                    edit_dialog(selected[0])
+                else:
+                    st.warning(tr("select_one"))
+            elif act_merge:
+                merge_dialog(selected)
+            else:
+                if act_out:
+                    svc.mark_depleted(household_id, ids, today, display_name)
+                elif act_still:
+                    svc.mark_still_going(household_id, ids, today)
+                elif act_list:
+                    svc.add_to_shopping_list(household_id, selected, "manual", display_name, today)
+                elif act_del:
+                    svc.delete_items(household_id, ids)
+                reset_selection()
+                st.rerun()
 
         export = pd.DataFrame([{
             "Item (EN)": i["name_en"], "Item (HE)": i["name_he"], "Category": i["category"], "Units": i["units"],
