@@ -20,6 +20,7 @@ from i18n import make_translator
 from notifications import send_reset_email
 from pantry_service import PantryService
 from text_parser import TextListParser
+from ui_theme import apply_theme, cart_spinner_html
 
 try:
     from streamlit_sortables import sort_items
@@ -29,6 +30,7 @@ except ImportError:
 
 st.set_page_config(page_title="Smart Pantry Assistant", page_icon="🛒", layout="wide")
 log = logging.getLogger("smart_pantry")
+apply_theme()
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -615,13 +617,16 @@ if st.sidebar.button(tr("process"), type="primary", disabled=not parser.availabl
     if not pasted.strip():
         st.sidebar.error(tr("paste_first"))
     else:
+        loader = st.sidebar.empty()
+        loader.markdown(cart_spinner_html(tr("quick_add_working")), unsafe_allow_html=True)
         try:
-            with st.spinner("…"):
-                parsed = parser.parse(pasted, categories)
+            parsed = parser.parse(pasted, categories)
+            loader.empty()
             st.session_state["staged_items"] = parsed
             st.session_state["staged_date"] = paste_date
             st.rerun()
         except RuntimeError as e:
+            loader.empty()
             st.sidebar.error(str(e))
 
 if st.session_state.get("staged_items"):

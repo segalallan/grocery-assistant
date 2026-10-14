@@ -122,6 +122,7 @@ T = {
     "quick_add": ("📋 Quick add a list", "📋 הוספה מהירה מרשימה"),
     "quick_add_help": ("Paste what you bought, one item per line.", "הדבק מה קנית, פריט בכל שורה."),
     "quick_add_items": ("Items", "פריטים"),
+    "quick_add_working": ("Sorting your groceries…", "מסדרים את הקניות…"),
     "process": ("⚡ Process list", "⚡ עבד רשימה"),
     "paste_first": ("Paste some items first.", "הדבק פריטים קודם."),
     "verify_title": ("🧾 Check the list before saving", "🧾 בדוק את הרשימה לפני שמירה"),
