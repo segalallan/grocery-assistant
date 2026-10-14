@@ -25,9 +25,10 @@ PBKDF2_ITERATIONS = 260_000
 RESET_CODE_MINUTES = 15      # how long an emailed code stays valid
 RESET_MAX_ATTEMPTS = 5       # wrong guesses before the code is burned
 RESET_RESEND_SECONDS = 60    # minimum gap between codes for the same account
+SESSION_DAYS = 30            # how long "remember me" keeps someone logged in
 
 TABLES = ["households", "users", "household_categories", "inventory",
-          "purchase_history", "purchases", "shopping_list", "password_resets"]  # dependency order
+          "purchase_history", "purchases", "shopping_list", "password_resets", "login_sessions"]  # dependency order
 
 
 def normalize_key(name_en: str | None, name_he: str | None = None) -> str:
@@ -119,6 +120,14 @@ _SCHEMA = [
         created_at TEXT NOT NULL,   -- ISO UTC timestamp
         expires_at TEXT NOT NULL,   -- ISO UTC timestamp
         attempts INTEGER DEFAULT 0
+    )""",
+    # "Remember me" logins. The browser cookie holds a random token; only its hash is stored here.
+    """CREATE TABLE IF NOT EXISTS login_sessions (
+        id {pk},
+        user_id INTEGER REFERENCES users(id),
+        token_hash TEXT UNIQUE NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS shopping_list (
         id {pk},
@@ -420,6 +429,57 @@ class Database:
             conn.execute("UPDATE users SET email_alerts = ?, email_lang = ? WHERE id = ?",
                          (1 if enabled else 0, lang, user_id))
 
+    # ---------- remember-me sessions ----------
+    @staticmethod
+    def _token_hash(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def create_session(self, user_id: int, now: datetime | None = None) -> str:
+        """Returns a new random token to put in the browser cookie."""
+        now = now or datetime.now(timezone.utc)
+        token = secrets.token_urlsafe(32)
+        with self.connect() as conn:
+            conn.execute("DELETE FROM login_sessions WHERE expires_at < ?", (now.isoformat(),))
+            conn.execute(
+                "INSERT INTO login_sessions (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (user_id, self._token_hash(token), now.isoformat(), (now + timedelta(days=SESSION_DAYS)).isoformat()))
+        return token
+
+    def user_for_session(self, token: str | None, now: datetime | None = None):
+        """Profile of the user a cookie token belongs to, or None if it's unknown/expired."""
+        if not isinstance(token, str) or not token:
+            return None
+        now = now or datetime.now(timezone.utc)
+        with self.connect() as conn:
+            row = conn.execute("SELECT user_id, expires_at FROM login_sessions WHERE token_hash = ?",
+                               (self._token_hash(token),)).fetchone()
+        if not row or now > datetime.fromisoformat(row["expires_at"]):
+            return None
+        return self.get_user(user_id=row["user_id"])
+
+    def end_session(self, token: str | None):
+        if isinstance(token, str) and token:
+            with self.connect() as conn:
+                conn.execute("DELETE FROM login_sessions WHERE token_hash = ?", (self._token_hash(token),))
+
+    def end_all_sessions(self, user_id: int, keep_token: str | None = None):
+        """Log a user out everywhere (after a password change/reset), optionally keeping this device."""
+        with self.connect() as conn:
+            if isinstance(keep_token, str) and keep_token:
+                conn.execute("DELETE FROM login_sessions WHERE user_id = ? AND token_hash != ?",
+                             (user_id, self._token_hash(keep_token)))
+            else:
+                conn.execute("DELETE FROM login_sessions WHERE user_id = ?", (user_id,))
+
+    # ---------- Google sign-in ----------
+    def create_oauth_user(self, email, display_name, household_name=None, join_code=None):
+        """Account for someone who signs in with Google: no usable password (they can set one via reset).
+
+        Returns (ok, error_message)."""
+        ok, err = self.create_user(email, secrets.token_urlsafe(32), display_name or email.split("@")[0], "",
+                                   household_name, join_code)
+        return ok, err
+
     # ---------- password reset ----------
     @staticmethod
     def _reset_hash(user_id: int, code: str) -> str:
@@ -472,6 +532,7 @@ class Database:
             conn.execute("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?",
                          (_hash_password(new_password, salt), salt, user["id"]))
             conn.execute("DELETE FROM password_resets WHERE user_id = ?", (user["id"],))
+            conn.execute("DELETE FROM login_sessions WHERE user_id = ?", (user["id"],))
         return True, "ok"
 
     def change_password(self, user_id: int, current_password: str, new_password: str) -> bool:

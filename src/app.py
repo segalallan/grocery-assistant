@@ -12,7 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from config import DB_PATH, today as app_today
+from config import DB_PATH, RESTOCK_THRESHOLD, today as app_today
 from db import RESET_CODE_MINUTES
 from db import Database
 from engine import PantryDepletionEngine
@@ -61,6 +61,45 @@ db = svc.db
 engine = svc.engine
 
 
+@st.cache_data(show_spinner=False, max_entries=2000)
+def _translate_cached(name_en: str, name_he: str) -> tuple[str, str]:
+    return get_parser().translate_pairs([(name_en, name_he)])[0]
+
+
+def fill_names(name_en: str, name_he: str) -> tuple[str, str]:
+    """Return (English, Hebrew), translating whichever one the user left out."""
+    return _translate_cached((name_en or "").strip(), (name_he or "").strip())
+
+
+def parser_ready() -> bool:
+    return get_parser().available
+
+
+def fix_missing_names() -> int:
+    """Translate names on existing pantry and shopping-list items that only have one language."""
+    from text_parser import normalize_name_pair
+    pantry = svc.get_pantry(household_id)
+    shop = svc.get_shopping_list(household_id)
+    targets = []
+    for it in pantry:
+        en, he = normalize_name_pair(it["name_en"], it["name_he"])
+        if bool(en) != bool(he):
+            targets.append(("p", it, (en, he)))
+    for r in shop:
+        en, he = normalize_name_pair(r["item_name_en"], r["item_name_he"])
+        if bool(en) != bool(he):
+            targets.append(("s", r, (en, he)))
+    if not targets:
+        return 0
+    filled = get_parser().translate_pairs([t[2] for t in targets])
+    for (kind, row, _), (en, he) in zip(targets, filled):
+        if kind == "p":
+            svc.update_item(household_id, row["id"], en, he, row["category"], row["units"])
+        else:
+            svc.update_shopping_item(household_id, row["id"], en, he, row["category"])
+    return len(targets)
+
+
 def reset_selection():
     """Untick every pantry item (new widget keys = fresh, unticked checkboxes)."""
     st.session_state["sel_ver"] = st.session_state.get("sel_ver", 0) + 1
@@ -83,7 +122,51 @@ if is_he:
 # ==========================================================================
 # Authentication
 # ==========================================================================
-def login(user: dict):
+SESSION_COOKIE = "pantry_session"
+
+
+def _google_enabled() -> bool:
+    """Google sign-in shows up only once the [auth] secrets are configured."""
+    try:
+        return "auth" in st.secrets
+    except Exception:
+        return False
+
+
+GOOGLE_ON = _google_enabled()
+
+
+def _google_user():
+    """(email, name) of a verified Google login in this browser, else None."""
+    if not GOOGLE_ON:
+        return None
+    try:
+        if not st.user.is_logged_in or st.user.get("email_verified") is False:
+            return None
+        return (st.user.email or "").strip().lower(), st.user.get("name") or ""
+    except Exception:
+        return None
+
+
+def _apply_cookie_ops():
+    """Set or clear the remember-me cookie in the browser (runs once, after login/logout)."""
+    op = st.session_state.pop("_cookie_op", None)
+    if not op:
+        return
+    if op[0] == "set":
+        value, max_age = op[1], 60 * 60 * 24 * 30
+    else:
+        value, max_age = "", 0
+    st.html(
+        f"""<script>
+        document.cookie = "{SESSION_COOKIE}={value}; Max-Age={max_age}; Path=/; SameSite=Lax"
+            + (location.protocol === "https:" ? "; Secure" : "");
+        </script>""",
+        unsafe_allow_javascript=True,
+    )
+
+
+def login(user: dict, remember: bool = False):
     st.session_state.update({
         "authenticated": True,
         "user_id": user["id"],
@@ -94,12 +177,72 @@ def login(user: dict):
         "household_code": user["household_code"],
         "email": user["email"],
     })
+    if remember:
+        token = db.create_session(user["id"])
+        st.session_state["session_token"] = token
+        st.session_state["_cookie_op"] = ("set", token)
 
 
 def logout():
+    db.end_session(st.session_state.get("session_token") or st.context.cookies.get(SESSION_COOKIE))
+    google = _google_user() is not None
+    lang = st.session_state.get("lang", "en")
     for k in list(st.session_state.keys()):
-        if k != "lang":
-            del st.session_state[k]
+        del st.session_state[k]
+    st.session_state["lang"] = lang
+    st.session_state["_cookie_op"] = ("clear",)
+    if google:
+        st.logout()  # also ends the Google session (Streamlit reloads the page)
+
+
+def try_auto_login() -> bool:
+    """Log in silently from a remember-me cookie or an existing Google login."""
+    token = st.context.cookies.get(SESSION_COOKIE)
+    user = db.user_for_session(token)
+    if user:
+        login(user)
+        st.session_state["session_token"] = token
+        return True
+    g = _google_user()
+    if g:
+        user = db.get_user(email=g[0])
+        if user:
+            login(user)
+            return True
+        st.session_state["google_signup"] = {"email": g[0], "name": g[1]}
+    return False
+
+
+def render_google_button(key: str):
+    if GOOGLE_ON:
+        if st.button(tr("google_btn"), key=key, width="stretch"):
+            st.login("google")
+        st.caption(f"<div style='text-align:center'>{tr('or_divider')}</div>", unsafe_allow_html=True)
+
+
+def render_google_signup(info: dict):
+    """First Google sign-in for this email: pick or join a household."""
+    st.title(tr("title"))
+    st.subheader(tr("google_welcome", email=info["email"]))
+    with st.form("google_signup_form"):
+        name = st.text_input(tr("your_name"), value=info.get("name", "")).strip()
+        st.markdown(f"**{tr('household_setup')}**")
+        join_code = st.text_input(tr("join_code")).strip()
+        house_name = st.text_input(tr("new_house_name"), placeholder="e.g. Herzliya Apartment").strip()
+        if st.form_submit_button(tr("create_acct_btn"), type="primary"):
+            if not join_code and not house_name:
+                st.error(tr("err_need_house"))
+            else:
+                ok, err = db.create_oauth_user(info["email"], name, house_name, join_code or None)
+                if ok:
+                    st.session_state.pop("google_signup", None)
+                    st.session_state["onboarding_user_id"] = db.get_user(email=info["email"])["id"]
+                    st.rerun()
+                else:
+                    st.error(err)
+    if st.button(tr("google_cancel")):
+        st.session_state.pop("google_signup", None)
+        st.logout()
 
 
 def render_auth_view():
@@ -110,18 +253,21 @@ def render_auth_view():
     with tab_login:
         if st.session_state.pop("reset_done", False):
             st.success(tr("reset_ok"))
+        render_google_button("google_login")
         with st.form("login_form"):
             email = st.text_input(tr("email")).strip().lower()
             password = st.text_input(tr("password"), type="password")
+            remember = st.checkbox(tr("remember_me"), value=True)
             if st.form_submit_button(tr("sign_in_btn"), type="primary"):
                 user = db.authenticate(email, password) if email and password else None
                 if user:
-                    login(user)
+                    login(user, remember=remember)
                     st.rerun()
                 else:
                     st.error(tr("err_creds"))
 
     with tab_signup:
+        render_google_button("google_signup_btn")
         with st.form("signup_form"):
             c1, c2 = st.columns(2)
             first = c1.text_input(tr("first_name")).strip()
@@ -148,7 +294,6 @@ def render_auth_view():
                         st.rerun()
                     else:
                         st.error(err)
-
 
     with tab_reset:
         render_password_reset()
@@ -217,12 +362,21 @@ def render_email_onboarding(user_id: int):
         db.set_email_prefs(user_id, wants == "yes", lang)
         user = db.get_user(user_id=user_id)
         st.session_state.pop("onboarding_user_id", None)
-        login(user)
+        login(user, remember=_google_user() is None)  # Google keeps its own login
         st.rerun()
 
 
+_apply_cookie_ops()
+
 if st.session_state.get("onboarding_user_id"):
     render_email_onboarding(st.session_state["onboarding_user_id"])
+    st.stop()
+
+if not st.session_state.get("authenticated") and not st.session_state.get("google_signup"):
+    try_auto_login()
+
+if st.session_state.get("google_signup") and not st.session_state.get("authenticated"):
+    render_google_signup(st.session_state["google_signup"])
     st.stop()
 
 if not st.session_state.get("authenticated"):
@@ -237,12 +391,12 @@ display_name = st.session_state["display_name"]
 household_name = st.session_state["household_name"]
 today = app_today()
 
-head_l, head_r = st.columns([4, 1.4])
+head_l, head_r = st.columns([3, 1.6], vertical_alignment="center")
 with head_l:
     st.title(tr("title"))
     st.markdown(f"👤 **{display_name}** · 🏠 **{household_name}** · {tr('invite')} `{st.session_state['household_code']}`")
-with head_r:
-    with st.popover(tr("account"), width="stretch"):
+with head_r, st.container(horizontal=True, wrap=True, gap="small", horizontal_alignment="right"):
+    with st.popover(tr("account"), width="content"):
         prefs = db.get_email_prefs(st.session_state["user_id"])
         with st.form("email_prefs"):
             st.markdown(f"**{tr('email_settings')}**")
@@ -260,10 +414,18 @@ with head_r:
                 if len(new_pw) < 8:
                     st.error(tr("err_pw_short"))
                 elif db.change_password(st.session_state["user_id"], cur_pw, new_pw):
+                    # Log out every other device; keep this one.
+                    db.end_all_sessions(st.session_state["user_id"], keep_token=st.session_state.get("session_token"))
                     st.success(tr("pw_changed"))
                 else:
                     st.error(tr("pw_wrong"))
-    if st.button(tr("logout_btn"), width="stretch"):
+        if parser_ready():
+            st.markdown(f"**{tr('fix_names_title')}**")
+            st.caption(tr("fix_names_help"))
+            if st.button(tr("fix_names_btn"), key="fix_names"):
+                n = fix_missing_names()
+                st.success(tr("fix_names_done", n=n))
+    if st.button(tr("logout_btn"), width="content"):
         logout()
         st.rerun()
 
@@ -288,6 +450,63 @@ def cat_options_with(current):
     if current and current not in opts:
         opts.append(current)
     return opts
+
+
+
+def risk_color(p: float) -> str:
+    if p >= RESTOCK_THRESHOLD:
+        return "#D64545"
+    if p >= 0.4:
+        return "#E0A030"
+    return "#2E7D5B"
+
+
+def render_pantry_row(it: dict, sel_ver: int):
+    """One item as a compact row: [✓ name ……… 90%] with details and a thin risk bar underneath.
+    Tapping the name ticks the box, which matters on a phone."""
+    p = it["prob_depleted"]
+    color = risk_color(p)
+    qty = f" ×{it['units']}" if it["units"] > 1 else ""
+    badges = []
+    if it["on_shopping_list"]:
+        badges.append(tr("on_list_badge"))
+    if it["confirmed_until"]:
+        badges.append(tr("confirmed_badge", date=it["confirmed_until"]))
+    with st.container(key=f"prow_{it['id']}", gap=None):
+        with st.container(horizontal=True, wrap=False, vertical_alignment="center", gap="small"):
+            st.checkbox(f"**{it['display_name']}**{qty}", key=f"chk_{sel_ver}_{it['id']}", width="stretch")
+            st.markdown(f"<span class='risk-pill' style='background:{color}1A;color:{color}'>{int(p * 100)}%</span>",
+                        unsafe_allow_html=True, width="content")
+        meta = (f"🏷️ {it['category_display']} · {it['purchase_date']} ({it['days_elapsed']}d) · "
+                + tr("lasts", d=round(it["effective_scale"])))
+        badge_html = "".join(f"<span class='row-badge'>{b}</span>" for b in badges)
+        st.markdown(
+            f"<div class='row-meta'>{meta}{badge_html}</div>"
+            f"<div class='risk-track'><div style='width:{max(2, int(p * 100))}%;background:{color}'></div></div>",
+            unsafe_allow_html=True)
+
+
+def render_shop_row(r: dict, sel_ver: int):
+    with st.container(key=f"srow_{r['id']}", gap=None):
+        st.checkbox(f"**{r['display_name']}**", key=f"shop_{sel_ver}_{r['id']}")
+        who = f" · {tr('by', who=r['added_by'])}" if r["added_by"] else ""
+        st.markdown(f"<div class='row-meta row-meta-last'>🏷️ {r['category_display']}{who}</div>",
+                    unsafe_allow_html=True)
+
+
+@st.dialog("✏️")
+def edit_shop_dialog(r):
+    with st.form(f"edit_shop_{r['id']}", border=False):
+        n_en = st.text_input(tr("item_name_en"), value=r["item_name_en"] or "")
+        n_he = st.text_input(tr("item_name_he"), value=r["item_name_he"] or "")
+        opts = cat_options_with(r["category"])
+        n_cat = st.selectbox(tr("category"), opts, format_func=cat_fmt,
+                             index=opts.index(r["category"]) if r["category"] in opts else 0)
+        if st.form_submit_button(tr("update_btn"), type="primary"):
+            n_en, n_he = fill_names(n_en, n_he)
+            svc.update_shopping_item(household_id, r["id"], n_en, n_he, n_cat)
+            st.session_state["shop_ver"] = st.session_state.get("shop_ver", 0) + 1
+            st.rerun()
 
 
 pantry_all = svc.get_pantry(household_id, today)
@@ -345,6 +564,7 @@ def edit_dialog(it):
         e_cat = st.selectbox(tr("category"), opts, format_func=cat_fmt,
                              index=opts.index(it["category"]) if it["category"] in opts else 0)
         if st.form_submit_button(tr("update_btn"), type="primary"):
+            e_en, e_he = fill_names(e_en, e_he)
             svc.update_item(household_id, it["id"], e_en, e_he, e_cat, e_qty)
             reset_selection()
             st.rerun()
@@ -388,6 +608,7 @@ with tab_pantry:
                 if not (p_en.strip() or p_he.strip()):
                     st.error(tr("need_name"))
                 else:
+                    p_en, p_he = fill_names(p_en, p_he)
                     svc.record_purchase(household_id, p_en, p_he, p_cat, int(p_qty), p_date, display_name)
                     st.rerun()
 
@@ -404,7 +625,9 @@ with tab_pantry:
     if not pantry_all:
         st.info(tr("empty_pantry"))
     else:
-        f1, f2, f3 = st.columns([2, 1, 1])
+        f1, f_rest = st.columns([2, 2])
+        f_row = f_rest.container(horizontal=True, wrap=False, gap="small")
+        f2, f3 = f_row, f_row
         search = f1.text_input(tr("search"), key="pantry_search", label_visibility="collapsed",
                                placeholder=tr("search")).strip().lower()
         cat_filter = f2.selectbox(tr("category"), [None] + cat_keys, key="pantry_cat", label_visibility="collapsed",
@@ -439,22 +662,7 @@ with tab_pantry:
             st.caption(tr("select_hint"))
 
             for it in items:
-                c_chk, c1, c2 = st.columns([0.4, 3.8, 2.8])
-                c_chk.checkbox(" ", key=f"chk_{sel_ver}_{it['id']}", label_visibility="collapsed")
-                with c1:
-                    qty = f" ×{it['units']}" if it["units"] > 1 else ""
-                    badges = []
-                    if it["on_shopping_list"]:
-                        badges.append(tr("on_list_badge"))
-                    if it["confirmed_until"]:
-                        badges.append(tr("confirmed_badge", date=it["confirmed_until"]))
-                    st.markdown(f"**{it['display_name']}**{qty}  " + ("  ".join(f":blue-badge[{b}]" for b in badges)))
-                    st.caption(f"🏷️ {it['category_display']} · {it['purchase_date']} ({it['days_elapsed']}d) · "
-                               + tr("lasts", d=round(it["effective_scale"])))
-                with c2:
-                    p = it["prob_depleted"]
-                    st.progress(p)
-                    st.caption(f"{tr('depletion_risk')}: **{int(p * 100)}%**")
+                render_pantry_row(it, sel_ver)
 
         if any([act_out, act_still, act_list, act_edit, act_merge, act_del]):
             selected = [i for i in items if st.session_state.get(f"chk_{sel_ver}_{i['id']}")]
@@ -503,9 +711,9 @@ with tab_shopping:
                 if not (s_en.strip() or s_he.strip()):
                     st.error(tr("need_name"))
                 else:
-                    svc.add_to_shopping_list(household_id, [{
-                        "name_en": s_en.strip() or s_he.strip(), "name_he": s_he.strip() or s_en.strip(),
-                        "category": s_cat}], "manual", display_name, today)
+                    s_en, s_he = fill_names(s_en, s_he)
+                    svc.add_to_shopping_list(household_id, [{"name_en": s_en, "name_he": s_he, "category": s_cat}],
+                                             "manual", display_name, today)
                     st.rerun()
 
     shop_all = svc.get_shopping_list(household_id)
@@ -516,7 +724,9 @@ with tab_shopping:
             r["display_name"] = name_of(r)
             r["category_display"] = cat_fmt(r["category"])
 
-        f1, f2, f3 = st.columns([2, 1, 1.4])
+        f1, f_rest = st.columns([2, 2])
+        f_row = f_rest.container(horizontal=True, wrap=False, gap="small")
+        f2, f3 = f_row, f_row
         s_search = f1.text_input(tr("search"), key="shop_search", label_visibility="collapsed",
                                  placeholder=tr("search")).strip().lower()
         s_filter = f2.selectbox(tr("category"), [None] + cat_keys, key="shop_cat", label_visibility="collapsed",
@@ -535,42 +745,48 @@ with tab_shopping:
         elif order == "name":
             rows.sort(key=lambda x: x["display_name"].lower())
         elif HAS_SORTABLES and not is_filtered and len(rows) > 1:
-            st.caption(tr("drag_caption"))
-            labels = {r["id"]: f"{r['display_name']} · {r['category_display']}  #{r['id']}" for r in rows}
-            current = [labels[r["id"]] for r in rows]
-            reordered = sort_items(current, direction="vertical", key=f"dnd_{household_id}")
-            if reordered and reordered != current:
-                by_label = {v: k for k, v in labels.items()}
-                svc.reorder_shopping_list(household_id, [by_label[lbl] for lbl in reordered])
-                st.rerun()
+            with st.expander(tr("reorder_title")):
+                st.caption(tr("drag_caption"))
+                labels = {r["id"]: f"{r['display_name']} · {r['category_display']}  #{r['id']}" for r in rows}
+                current = [labels[r["id"]] for r in rows]
+                reordered = sort_items(current, direction="vertical", key=f"dnd_{household_id}")
+                if reordered and reordered != current:
+                    by_label = {v: k for k, v in labels.items()}
+                    svc.reorder_shopping_list(household_id, [by_label[lbl] for lbl in reordered])
+                    st.rerun()
         elif is_filtered:
             st.caption(tr("drag_filtered"))
         elif not HAS_SORTABLES:
             st.caption(tr("sortables_missing"))
 
-        st.divider()
-        for r in rows:
-            c1, c2, c3, c4, c5 = st.columns([3.6, 1.8, 0.6, 0.6, 1.2])
-            who = f" :gray[{tr('by', who=r['added_by'])}]" if r["added_by"] else ""
-            c1.markdown(f"**{r['display_name']}**{who}")
-            c2.caption(f"🏷️ {r['category_display']}")
-            with c3:
-                with st.popover("✏️"):
-                    with st.form(f"edit_shop_{r['id']}"):
-                        n_en = st.text_input(tr("item_name_en"), value=r["item_name_en"] or "")
-                        n_he = st.text_input(tr("item_name_he"), value=r["item_name_he"] or "")
-                        opts = cat_options_with(r["category"])
-                        n_cat = st.selectbox(tr("category"), opts, format_func=cat_fmt,
-                                             index=opts.index(r["category"]) if r["category"] in opts else 0)
-                        if st.form_submit_button(tr("update_btn")):
-                            svc.update_shopping_item(household_id, r["id"], n_en, n_he, n_cat)
-                            st.rerun()
-            if c4.button("🗑️", key=f"del_shop_{r['id']}"):
-                svc.remove_from_shopping_list(household_id, r["id"])
-                st.rerun()
-            if c5.button(tr("bought_btn"), key=f"bought_{r['id']}", width="stretch"):
-                svc.bought_from_list(household_id, r["id"], 1, display_name, today)
-                st.toast(f"✅ {r['display_name']}")
+        shop_ver = st.session_state.setdefault("shop_ver", 0)
+        # Like the pantry: tick items as you shop (instant), then press one button.
+        with st.form("shop_select", border=False):
+            with st.container(horizontal=True, key="shop_actions"):  # sticky, see ui_theme.py
+                act_bought = st.form_submit_button(tr("bought_btn"), type="primary")
+                act_sedit = st.form_submit_button(tr("edit_btn"))
+                act_remove = st.form_submit_button(tr("remove_btn"))
+            for r in rows:
+                render_shop_row(r, shop_ver)
+
+        if act_bought or act_sedit or act_remove:
+            chosen = [r for r in rows if st.session_state.get(f"shop_{shop_ver}_{r['id']}")]
+            if not chosen:
+                st.warning(tr("select_first"))
+            elif act_sedit:
+                if len(chosen) == 1:
+                    edit_shop_dialog(chosen[0])
+                else:
+                    st.warning(tr("select_one"))
+            else:
+                for r in chosen:
+                    if act_bought:
+                        svc.bought_from_list(household_id, r["id"], 1, display_name, today)
+                    else:
+                        svc.remove_from_shopping_list(household_id, r["id"])
+                if act_bought:
+                    st.toast(tr("bought_n", n=len(chosen)))
+                st.session_state["shop_ver"] = shop_ver + 1
                 st.rerun()
 
 # ==========================================================================

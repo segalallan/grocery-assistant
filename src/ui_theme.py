@@ -67,14 +67,41 @@ _CSS = f"""
 
 /* Pantry action buttons stay pinned to the top while scrolling the list.
    (The sticky element must be the wrapper Streamlit puts around the row.) */
-[data-testid="stLayoutWrapper"]:has(> .st-key-pantry_actions) {{
+[data-testid="stLayoutWrapper"]:has(> .st-key-pantry_actions),
+[data-testid="stLayoutWrapper"]:has(> .st-key-shop_actions) {{
   position: sticky; top: 3.75rem; z-index: 999;
   background: var(--background-color, #fff);
   box-shadow: 0 6px 8px -8px rgba(0,0,0,.25);
 }}
-.st-key-pantry_actions {{ padding: .5rem 0; }}
+.st-key-pantry_actions, .st-key-shop_actions {{ padding: .5rem 0; }}
 /* Anything scrolled into view (e.g. by keyboard) lands below the pinned bar, not under it. */
 [data-testid="stForm"] [data-testid="stCheckbox"] {{ scroll-margin-top: 8rem; }}
+
+/* Compact list rows (pantry + shopping list): one line per item, readable on a phone. */
+[class*="st-key-prow_"], [class*="st-key-srow_"] {{
+  gap: .1rem !important; padding: .45rem 0 .55rem; border-bottom: 1px solid rgba(128,128,128,.18);
+}}
+[class*="st-key-prow_"] [data-testid="stCheckbox"] label,
+[class*="st-key-srow_"] [data-testid="stCheckbox"] label {{ width: 100%; padding: .15rem 0; cursor: pointer; }}
+[class*="st-key-srow_"] [data-testid="stCheckbox"] p {{ font-size: 1.05rem; }}
+[class*="st-key-prow_"] [data-testid="stMarkdownContainer"],
+[class*="st-key-srow_"] [data-testid="stMarkdownContainer"] {{ margin-bottom: 0 !important; }}
+.row-meta {{ font-size: .8rem; color: #777; margin-left: 1.75rem; line-height: 1.35; }}
+.row-badge {{ display: inline-block; margin-left: .4rem; padding: 0 .4rem; border-radius: .6rem;
+              background: rgba(46,125,91,.12); color: #2E7D5B; font-size: .72rem; }}
+.risk-pill {{ display: inline-block; min-width: 3.2rem; text-align: center; padding: .1rem .5rem;
+              border-radius: 1rem; font-weight: 700; font-size: .85rem; }}
+.risk-track {{ height: 4px; margin: .35rem 0 0 1.75rem; border-radius: 2px; background: rgba(128,128,128,.15); }}
+.risk-track > div {{ height: 100%; border-radius: 2px; }}
+
+/* Page title: a bit smaller than Streamlit's default so it stays on one line. */
+h1 {{ font-size: clamp(1.5rem, 2.5vw, 2.1rem) !important; }}
+
+/* Phones: smaller page title and less padding so the list starts higher up. */
+@media (max-width: 640px) {{
+  h1 {{ font-size: 1.55rem !important; padding: .25rem 0 !important; }}
+  .stMainBlockContainer {{ padding-top: 2.5rem !important; }}
+}}
 
 /* Don't grey out the page while it refreshes. */
 [data-stale="true"] {{ opacity: 1 !important; transition: none !important; }}

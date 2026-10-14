@@ -1,5 +1,5 @@
 # App (tested with these versions)
-streamlit>=1.65,<2
+streamlit[auth]>=1.65,<2  # [auth] = Google sign-in support
 pandas>=3.0,<4
 plotly>=7.1,<8
 openai>=3.29,<4

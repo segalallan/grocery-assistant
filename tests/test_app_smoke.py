@@ -79,11 +79,13 @@ def test_add_purchase_and_full_dashboard(env):
     assert len(svc.get_pantry(hh)) == 1
     assert {s["item_name_en"] for s in svc.get_shopping_list(hh)} == {"Bread", "Milk"}
 
-    # Buy bread from the shopping list
-    bought = next(b for b in at.button if b.key and b.key.startswith("bought_"))
-    bought.click().run()
+    # Buy bread from the shopping list: tick it, then the one "Bought" button
+    bread = next(c for c in at.checkbox if c.key and c.key.startswith("shop_") and "Bread" in c.label)
+    bread.check()
+    next(b for b in at.button if b.label == "✅ Bought").click().run()
     assert not at.exception, at.exception
-    assert len(svc.get_shopping_list(hh)) == 1
+    assert [s["item_name_en"] for s in svc.get_shopping_list(hh)] == ["Milk"]
+    assert any(i["name_en"] == "Bread" for i in svc.get_pantry(hh))
 
 
 def test_hebrew_mode_renders(env):
@@ -183,3 +185,64 @@ def test_action_without_selection_warns(env):
     assert not at.exception, at.exception
     assert any("Select at least one" in w.value for w in at.warning)
     assert len(svc.get_pantry(hh)) == 1
+
+
+def test_google_button_only_when_configured(env):
+    at = fresh_app(env).run()
+    assert not [b for b in at.button if "Google" in b.label]
+    at2 = fresh_app(env)
+    at2.secrets["auth"] = {"redirect_uri": "http://localhost:8501/oauth2callback", "cookie_secret": "x",
+                           "google": {"client_id": "id", "client_secret": "s",
+                                      "server_metadata_url": "https://accounts.google.com/.well-known/openid-configuration"}}
+    at2.run()
+    assert not at2.exception, at2.exception
+    assert [b for b in at2.button if b.label == "Continue with Google"]
+
+
+def test_first_google_signin_joins_household(env):
+    with env.connect() as c:
+        code = c.execute("SELECT household_code FROM households").fetchone()[0]
+    at = fresh_app(env)
+    at.session_state["google_signup"] = {"email": "gal@gmail.com", "name": "Gal Cohen"}
+    at.run()
+    assert not at.exception, at.exception
+    assert any("gal@gmail.com" in h.value for h in at.subheader)
+    at.text_input[1].input(code)
+    [b for b in at.button if b.label == "Create Account"][0].click().run()
+    assert not at.exception, at.exception
+    # then the usual email-preferences step
+    [b for b in at.button if b.label == "Continue"][0].click().run()
+    assert at.session_state["authenticated"] is True
+    u = env.get_user(email="gal@gmail.com")
+    assert u["display_name"] == "Gal Cohen"
+    assert u["household_id"] == env.get_user(email="a@b.com")["household_id"]
+
+
+def test_names_are_normalized_without_api_key(env):
+    """No OpenAI key: a Hebrew-only item still gets both fields filled (copy fallback), never blank."""
+    from text_parser import TextListParser, normalize_name_pair
+    assert normalize_name_pair("חלב", "") == ("", "חלב")
+    assert normalize_name_pair("Milk", "Milk") == ("Milk", "")
+    assert normalize_name_pair("", "Milk") == ("Milk", "")
+    assert normalize_name_pair("Milk", "חלב") == ("Milk", "חלב")
+    assert TextListParser().translate_pairs([("חלב", ""), ("Eggs", "ביצים")]) == [("חלב", "חלב"), ("Eggs", "ביצים")]
+
+
+def test_translation_fills_missing_names(monkeypatch):
+    import json, types
+    from text_parser import TextListParser
+    p = TextListParser()
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    calls = []
+
+    def fake_create(**kw):
+        req = json.loads(kw["messages"][0]["content"].split("\n", 1)[1])
+        calls.append(req)
+        out = [{"i": r["i"], "en": r["en"] or "Milk", "he": r["he"] or "חלב"} for r in req]
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content=json.dumps({"items": out})))])
+
+    p._client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=fake_create)))
+    assert p.translate_pairs([("חלב", ""), ("Bread", "לחם"), ("Milk", "")]) == \
+        [("Milk", "חלב"), ("Bread", "לחם"), ("Milk", "חלב")]
+    assert len(calls) == 1 and len(calls[0]) == 2  # one API call, only for the incomplete items
