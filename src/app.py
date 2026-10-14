@@ -428,7 +428,7 @@ with tab_pantry:
         # The list is a form: ticking items is instant and runs nothing.
         # The app only runs when one of the action buttons is pressed.
         with st.form("pantry_select", border=False):
-            with st.container(horizontal=True):
+            with st.container(horizontal=True, key="pantry_actions"):  # sticky, see ui_theme.py
                 act_out = st.form_submit_button(tr("ran_out"))
                 act_still = st.form_submit_button(tr("still_going"))
                 act_list = st.form_submit_button(tr("add_to_list"))

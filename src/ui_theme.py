@@ -65,6 +65,17 @@ _CSS = f"""
 }}
 @keyframes pantry-fade-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
 
+/* Pantry action buttons stay pinned to the top while scrolling the list.
+   (The sticky element must be the wrapper Streamlit puts around the row.) */
+[data-testid="stLayoutWrapper"]:has(> .st-key-pantry_actions) {{
+  position: sticky; top: 3.75rem; z-index: 999;
+  background: var(--background-color, #fff);
+  box-shadow: 0 6px 8px -8px rgba(0,0,0,.25);
+}}
+.st-key-pantry_actions {{ padding: .5rem 0; }}
+/* Anything scrolled into view (e.g. by keyboard) lands below the pinned bar, not under it. */
+[data-testid="stForm"] [data-testid="stCheckbox"] {{ scroll-margin-top: 8rem; }}
+
 /* Don't grey out the page while it refreshes. */
 [data-stale="true"] {{ opacity: 1 !important; transition: none !important; }}
 </style>
