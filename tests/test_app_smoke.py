@@ -90,7 +90,8 @@ def test_add_purchase_and_full_dashboard(env):
 
 def test_hebrew_mode_renders(env):
     at = logged_in(env)
-    at.selectbox[0].select("עברית").run()
+    at.segmented_control(key="lang_switch").set_value("he").run()
+    assert at.session_state["lang"] == "he"
     assert not at.exception, at.exception
 
 
@@ -291,3 +292,87 @@ def test_manual_add_existing_product_with_size(env):
     assert not at.exception, at.exception
     item = svc.get_pantry(hh)[0]
     assert item["product_id"] == milk.product_id and item["eff_units"] == 1.5
+
+
+class _FakeSMTP:
+    sent = []
+
+    def __init__(self, *a, **k): pass
+    def login(self, *a): pass
+    def sendmail(self, s, to, msg): _FakeSMTP.sent.append((to, msg)); return {}
+    def quit(self): pass
+
+
+def _mail(monkeypatch):
+    import notifications
+    _FakeSMTP.sent = []
+    monkeypatch.setattr(notifications.smtplib, "SMTP_SSL", _FakeSMTP)
+    monkeypatch.setenv("EMAIL_SENDER", "bot@x.com")
+    monkeypatch.setenv("EMAIL_PASSWORD", "pw")
+    monkeypatch.setenv("ADMIN_EMAILS", "boss@x.com")
+
+
+def test_feedback_is_saved_and_emailed(env, monkeypatch):
+    _mail(monkeypatch)
+    at = logged_in(env)
+    next(t for t in at.text_area if t.placeholder.startswith("What's working")).input("Love it, but the bars are tiny")
+    next(b for b in at.button if b.proto.form_id == "feedback_form").click().run()
+    assert not at.exception, at.exception
+    assert env.list_feedback()[0]["message"] == "Love it, but the bars are tiny"
+    assert _FakeSMTP.sent and _FakeSMTP.sent[0][0] == ["boss@x.com"]
+
+
+def test_crash_shows_friendly_message_logs_and_emails_once(env, monkeypatch, tmp_path):
+    _mail(monkeypatch)
+    crash = tmp_path / "crash_app.py"
+    crash.write_text("import streamlit as st\nst.write('hi')\nraise ValueError('boom')\n")
+    monkeypatch.setenv("PANTRY_APP_FILE", str(crash))
+    at = fresh_app(env).run()
+    assert any("Something went wrong" in e.value for e in at.error)
+    assert not at.exception                                   # no raw traceback for normal users
+    errs = env.list_errors()
+    assert len(errs) == 1 and errs[0]["signature"].startswith("ValueError@crash_app.py")
+    assert len(_FakeSMTP.sent) == 1
+    at.run()                                                   # same error again within the hour
+    assert env.list_errors()[0]["count"] == 2 and len(_FakeSMTP.sent) == 1
+
+
+def test_rerun_and_stop_are_not_errors(env, monkeypatch, tmp_path):
+    _mail(monkeypatch)
+    ok = tmp_path / "stop_app.py"
+    ok.write_text("import streamlit as st\nst.write('x')\nst.stop()\n")
+    monkeypatch.setenv("PANTRY_APP_FILE", str(ok))
+    at = fresh_app(env).run()
+    assert not at.error and env.list_errors() == []
+
+
+def test_intro_card_shows_until_dismissed(env):
+    at = logged_in(env)
+    assert any("How Smart Pantry works" in m.value for m in at.markdown)
+    next(b for b in at.button if b.key == "intro_ok").click().run()
+    assert not at.exception, at.exception
+    assert env.get_user(email="a@b.com")["intro_dismissed"] == 1
+    assert not any("How Smart Pantry works" in m.value for m in at.markdown)
+
+
+def test_admin_tab_only_for_admins(env, monkeypatch):
+    monkeypatch.setenv("ADMIN_EMAILS", "someone@else.com")
+    at = logged_in(env)
+    assert not [t for t in at.tabs if "Admin" in t.label]
+    monkeypatch.setenv("ADMIN_EMAILS", "a@b.com")
+    at = logged_in(env)
+    assert not at.exception, at.exception
+    assert [t for t in at.tabs if "Admin" in t.label]
+    assert any(m.label == "Households" for m in at.metric)
+
+
+def test_delete_account_from_the_app(env):
+    at = logged_in(env)
+    next(t for t in at.text_input if t.key == "delete_confirm").input("wrong@x.com")
+    next(b for b in at.button if b.proto.form_id == "delete_account").click().run()
+    assert env.get_user(email="a@b.com") is not None            # mismatch → nothing deleted
+    next(t for t in at.text_input if t.key == "delete_confirm").input("a@b.com")
+    next(b for b in at.button if b.proto.form_id == "delete_account").click().run()
+    assert not at.exception, at.exception
+    assert env.get_user(email="a@b.com") is None
+    assert not at.session_state["authenticated"] if "authenticated" in at.session_state else True

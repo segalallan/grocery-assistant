@@ -92,6 +92,37 @@ def send_alert_email(server, sender, recipient, household_name, items, lang="en"
         raise RuntimeError(f"Recipient refused: {refused}")
 
 
+def admin_emails() -> list[str]:
+    """Who gets feedback and error reports: ADMIN_EMAILS (comma-separated), else the sender address."""
+    raw = get_secret("ADMIN_EMAILS") or get_secret("EMAIL_SENDER", "GMAIL_USER") or ""
+    return [e.strip().lower() for e in str(raw).split(",") if "@" in e]
+
+
+def send_admin_email(subject: str, html_body: str) -> bool:
+    """Best effort: never raises (it's used while reporting other problems)."""
+    to = admin_emails()
+    if not to:
+        return False
+    try:
+        sender, password = _smtp_credentials()
+        msg = MIMEMultipart("alternative")
+        msg["Subject"], msg["From"], msg["To"] = subject, sender, ", ".join(to)
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
+        try:
+            server.login(sender, password)
+            server.sendmail(sender, to, msg.as_string())
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
+        return True
+    except Exception:
+        log.exception("Admin email failed")
+        return False
+
+
 RESET_TEXT = {
     "en": {"dir": "ltr", "subject": "Your Smart Pantry password reset code",
            "title": "Password reset", "intro": "Use this code to set a new password:",

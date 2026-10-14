@@ -24,6 +24,7 @@ Code lives in `src/`; priors in `data/`. Run commands from the project folder.
 | `db.py` | Connections, schema + automatic migrations, accounts, categories. |
 | `text_parser.py` | Quick Add: pasted list → items (OpenAI). |
 | `notifications.py`, `src/jobs/send_alerts.py` | Daily email alerts, run headless on a schedule. |
+| `src/normalize.py`, `src/matcher.py` | Item names → products: size parsing, alias/fuzzy/AI matching. |
 | `config.py` | Paths, threshold, timezone, secrets lookup. |
 | `i18n.py` | English / Hebrew strings. |
 | `data/category_priors.json` | Typical per-unit lifetime (median days) and shape per category. |

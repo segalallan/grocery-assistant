@@ -521,6 +521,8 @@ class PantryService:
                 "days_confirmed": confirmed,
                 "per_unit_scale": per_unit,
                 "effective_scale": self.engine.effective_scale(r["category"], per_unit, eff),
+                # median lifetime: the day by which it's 50/50 that it's gone (what "usually lasts" means)
+                "typical_days": self.engine.median_days(r["category"], per_unit, eff),
                 "prob_depleted": self.engine.depletion_probability(r["category"], days, per_unit, eff, confirmed),
                 "on_shopping_list": r["item_key"] in on_list,
                 "last_alerted": r["last_alerted"],

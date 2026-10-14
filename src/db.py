@@ -28,7 +28,8 @@ RESET_RESEND_SECONDS = 60    # minimum gap between codes for the same account
 SESSION_DAYS = 30            # how long "remember me" keeps someone logged in
 
 TABLES = ["households", "users", "household_categories", "products", "product_aliases", "inventory",
-          "purchase_history", "purchases", "shopping_list", "password_resets", "login_sessions"]  # dependency order
+          "purchase_history", "purchases", "shopping_list", "password_resets", "login_sessions",
+          "feedback", "app_errors"]  # dependency order
 
 
 def normalize_key(name_en: str | None, name_he: str | None = None) -> str:
@@ -140,6 +141,28 @@ _SCHEMA = [
         expires_at TEXT NOT NULL,   -- ISO UTC timestamp
         attempts INTEGER DEFAULT 0
     )""",
+    # Beta feedback sent from the app.
+    """CREATE TABLE IF NOT EXISTS feedback (
+        id {pk},
+        user_id INTEGER,
+        household_id INTEGER,
+        email TEXT,
+        message TEXT NOT NULL,
+        context TEXT,
+        created_at TEXT NOT NULL
+    )""",
+    # Unexpected errors, one row per distinct error (signature), with a running count.
+    """CREATE TABLE IF NOT EXISTS app_errors (
+        id {pk},
+        signature TEXT UNIQUE NOT NULL,
+        message TEXT,
+        traceback TEXT,
+        last_user TEXT,
+        count INTEGER DEFAULT 1,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        last_notified TEXT
+    )""",
     # "Remember me" logins. The browser cookie holds a random token; only its hash is stored here.
     """CREATE TABLE IF NOT EXISTS login_sessions (
         id {pk},
@@ -165,7 +188,8 @@ _SCHEMA = [
 # Columns added after v1; applied to older databases.
 MIGRATION_COLUMNS = {
     # eff_units = amount in "reference packages" (2 x 2 L with a 1 L reference = 4.0). NULL on old rows → use units.
-    "users": {"email_alerts": "INTEGER DEFAULT 1", "email_lang": "TEXT DEFAULT 'en'"},
+    "users": {"email_alerts": "INTEGER DEFAULT 1", "email_lang": "TEXT DEFAULT 'en'",
+              "intro_dismissed": "INTEGER DEFAULT 0"},
     "inventory": {"item_key": "TEXT", "confirmed_until": "TEXT", "last_alerted": "TEXT"},
     "purchase_history": {"item_key": "TEXT", "units": "INTEGER", "kind": "TEXT"},
     "purchases": {"item_key": "TEXT"},
@@ -424,6 +448,77 @@ class Database:
         return counts
 
     # ---------- accounts ----------
+    @staticmethod
+    def _create_household(conn, name):
+        hh_id = conn.execute("INSERT INTO households (household_code, name) VALUES (?, ?) RETURNING id",
+                             (secrets.token_hex(4).upper(), name or "My Household")).fetchone()[0]
+        conn.executemany("INSERT INTO household_categories (household_id, name_en, name_he) VALUES (?, ?, ?) "
+                         "ON CONFLICT DO NOTHING", [(hh_id, en, he) for en, he in DEFAULT_CATEGORIES])
+        return hh_id
+
+    HOUSEHOLD_TABLES = ("inventory", "purchases", "purchase_history", "shopping_list",
+                        "product_aliases", "products", "household_categories")
+
+    @classmethod
+    def _delete_household_data(cls, conn, household_id):
+        for t in cls.HOUSEHOLD_TABLES:
+            conn.execute(f"DELETE FROM {t} WHERE household_id = ?", (household_id,))
+        conn.execute("DELETE FROM households WHERE id = ?", (household_id,))
+
+    def _drop_household_if_empty(self, conn, household_id):
+        if household_id and not conn.execute("SELECT 1 FROM users WHERE household_id = ?", (household_id,)).fetchone():
+            self._delete_household_data(conn, household_id)
+
+    def leave_household(self, user_id: int, new_household_name: str) -> int:
+        """Move the user into a brand-new household of their own. The old household keeps its data
+        (it's deleted only if nobody is left in it). Returns the new household id."""
+        with self.connect() as conn:
+            old = conn.execute("SELECT household_id FROM users WHERE id = ?", (user_id,)).fetchone()
+            new_id = self._create_household(conn, new_household_name)
+            conn.execute("UPDATE users SET household_id = ? WHERE id = ?", (new_id, user_id))
+            self._drop_household_if_empty(conn, old["household_id"] if old else None)
+        return new_id
+
+    def delete_user(self, user_id: int):
+        """Delete an account, its logins and reset codes. The household's data is deleted too
+        if this was its last member; otherwise it stays for the remaining members."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT household_id FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not row:
+                return
+            for t in ("login_sessions", "password_resets"):
+                conn.execute(f"DELETE FROM {t} WHERE user_id = ?", (user_id,))
+            conn.execute("UPDATE feedback SET user_id = NULL, email = NULL WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            self._drop_household_if_empty(conn, row["household_id"])
+
+    def set_intro_dismissed(self, user_id: int, dismissed: bool = True):
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET intro_dismissed = ? WHERE id = ?", (1 if dismissed else 0, user_id))
+
+    def household_members(self, household_id) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT id, display_name, email FROM users WHERE household_id = ? ORDER BY id",
+                                (household_id,)).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    def admin_stats(self, today_iso: str) -> list[dict]:
+        """Per-household activity for the beta admin view."""
+        d7 = (datetime.fromisoformat(today_iso) - timedelta(days=7)).date().isoformat()
+        d30 = (datetime.fromisoformat(today_iso) - timedelta(days=30)).date().isoformat()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT h.id, h.name, h.household_code,
+                          (SELECT COUNT(*) FROM users u WHERE u.household_id = h.id) AS members,
+                          (SELECT COUNT(*) FROM products p WHERE p.household_id = h.id) AS products,
+                          (SELECT COUNT(*) FROM inventory i WHERE i.household_id = h.id) AS in_pantry,
+                          (SELECT COUNT(*) FROM purchases pu WHERE pu.household_id = h.id AND pu.purchase_date >= ?) AS buys_7d,
+                          (SELECT COUNT(*) FROM purchases pu WHERE pu.household_id = h.id AND pu.purchase_date >= ?) AS buys_30d,
+                          (SELECT COUNT(*) FROM purchase_history ph WHERE ph.household_id = h.id) AS cycles,
+                          (SELECT MAX(pu.purchase_date) FROM purchases pu WHERE pu.household_id = h.id) AS last_purchase
+                   FROM households h ORDER BY h.id""", (d7, d30)).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
     def create_user(self, email, password, first_name, last_name, household_name=None, join_code=None):
         """Returns (ok, error_message)."""
         email = email.strip().lower()
@@ -438,15 +533,7 @@ class Database:
                     return False, "Invalid join code."
                 hh_id = row["id"]
             else:
-                hh_id = conn.execute(
-                    "INSERT INTO households (household_code, name) VALUES (?, ?) RETURNING id",
-                    (secrets.token_hex(4).upper(), household_name or "My Household"),
-                ).fetchone()[0]
-                conn.executemany(
-                    "INSERT INTO household_categories (household_id, name_en, name_he) VALUES (?, ?, ?) "
-                    "ON CONFLICT DO NOTHING",
-                    [(hh_id, en, he) for en, he in DEFAULT_CATEGORIES],
-                )
+                hh_id = self._create_household(conn, household_name)
 
             salt = os.urandom(16)
             conn.execute(
@@ -472,7 +559,7 @@ class Database:
         return user
 
     _PROFILE_SQL = """SELECT u.id, u.username, u.display_name, u.household_id, u.email,
-                             u.password_hash, u.salt, u.email_alerts, u.email_lang,
+                             u.password_hash, u.salt, u.email_alerts, u.email_lang, u.intro_dismissed,
                              h.name AS household_name, h.household_code
                       FROM users u LEFT JOIN households h ON u.household_id = h.id"""
 
@@ -545,6 +632,42 @@ class Database:
                              (user_id, self._token_hash(keep_token)))
             else:
                 conn.execute("DELETE FROM login_sessions WHERE user_id = ?", (user_id,))
+
+    # ---------- feedback & errors ----------
+    def add_feedback(self, user_id, household_id, email, message, context=""):
+        with self.connect() as conn:
+            conn.execute("INSERT INTO feedback (user_id, household_id, email, message, context, created_at) "
+                         "VALUES (?, ?, ?, ?, ?, ?)",
+                         (user_id, household_id, email, message.strip()[:4000], context,
+                          datetime.now(timezone.utc).isoformat(timespec="seconds")))
+
+    def list_feedback(self, limit=100):
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM feedback ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    def log_error(self, signature, message, tb, user, now=None, notify_every_minutes=60) -> bool:
+        """Record an error occurrence. Returns True if the admin should be emailed about it now."""
+        now = now or datetime.now(timezone.utc)
+        iso = now.isoformat(timespec="seconds")
+        with self.connect() as conn:
+            row = conn.execute("SELECT id, last_notified FROM app_errors WHERE signature = ?", (signature,)).fetchone()
+            if not row:
+                conn.execute("INSERT INTO app_errors (signature, message, traceback, last_user, count, first_seen, "
+                             "last_seen, last_notified) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+                             (signature, message[:1000], tb[-8000:], user, iso, iso, iso))
+                return True
+            notify = (not row["last_notified"] or
+                      now - datetime.fromisoformat(row["last_notified"]) >= timedelta(minutes=notify_every_minutes))
+            conn.execute("UPDATE app_errors SET count = count + 1, last_seen = ?, last_user = ?, message = ?, "
+                         "traceback = ?" + (", last_notified = ?" if notify else "") + " WHERE id = ?",
+                         (iso, user, message[:1000], tb[-8000:], *([iso] if notify else []), row["id"]))
+            return notify
+
+    def list_errors(self, limit=50):
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM app_errors ORDER BY last_seen DESC LIMIT ?", (limit,)).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
 
     # ---------- Google sign-in ----------
     def create_oauth_user(self, email, display_name, household_name=None, join_code=None):

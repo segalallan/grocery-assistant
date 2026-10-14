@@ -116,6 +116,10 @@ class PantryDepletionEngine:
         # units may be fractional (e.g. 0.5 = half a reference package)
         return float(base) * max(0.05, float(units or 1))
 
+    def median_days(self, category: str | None, per_unit_scale: float | None, units: float) -> float:
+        """Days until it's 50/50 that the item is used up (fresh purchase, no confirmations)."""
+        return self.effective_scale(category, per_unit_scale, units) * math.log(2.0) ** (1.0 / self.rho(category))
+
     def depletion_probability(self, category: str | None, days_elapsed: float,
                               per_unit_scale: float | None = None, units: int = 1,
                               days_confirmed: float | None = None) -> float:
