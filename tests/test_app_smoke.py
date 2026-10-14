@@ -246,3 +246,48 @@ def test_translation_fills_missing_names(monkeypatch):
     assert p.translate_pairs([("חלב", ""), ("Bread", "לחם"), ("Milk", "")]) == \
         [("Milk", "חלב"), ("Bread", "לחם"), ("Milk", "חלב")]
     assert len(calls) == 1 and len(calls[0]) == 2  # one API call, only for the incomplete items
+
+
+def _svc(env):
+    from engine import PantryDepletionEngine
+    from pantry_service import PantryService
+    return PantryService(env, PantryDepletionEngine())
+
+
+def test_review_table_commits_matches_and_new_items(env):
+    from config import today
+    svc = _svc(env)
+    hh = env.authenticate("a@b.com", "password1")["household_id"]
+    milk = svc.record_purchase(hh, "3% Milk 1L", "חלב 3%", "Dairy & Eggs", 1, today() - timedelta(days=8), "Avi")
+    at = logged_in(env)
+    at.session_state["staged_items"] = [
+        {"raw_name": "חלב טרה 3% 2 ליטר", "name_en": "3% Milk", "name_he": "חלב 3%", "category": "Dairy & Eggs",
+         "units": 1, "product_id": milk.product_id, "match": "ai", "size": "2 L"},
+        {"raw_name": "פסטה פנה 500 גרם", "name_en": "Penne pasta", "name_he": "פסטה פנה", "category": "Pantry Staples",
+         "units": 2, "product_id": None, "match": "new", "size": "500 g"},
+    ]
+    at.session_state["staged_date"] = today()
+    at.run()
+    assert not at.exception, at.exception
+    next(b for b in at.button if b.label == "✅ Save to pantry").click().run()
+    assert not at.exception, at.exception
+    items = {i["name_en"]: i for i in svc.get_pantry(hh)}
+    assert items["3% Milk"]["eff_units"] == 2.0                    # 2 L with a 1 L reference
+    assert items["Penne pasta"]["size"].amount == 500
+    assert svc.get_aliases(hh)["חלב טרה 3%"] == milk.product_id     # the receipt wording is now remembered
+    assert len(svc.get_products(hh)) == 2
+
+
+def test_manual_add_existing_product_with_size(env):
+    from config import today
+    svc = _svc(env)
+    hh = env.authenticate("a@b.com", "password1")["household_id"]
+    milk = svc.record_purchase(hh, "Milk 1L", "", "Dairy & Eggs", 1, today() - timedelta(days=5), "Avi")
+    at = logged_in(env)
+    form_select = next(s for s in at.selectbox if s.label == "Product")
+    form_select.select(milk.product_id)
+    next(t for t in at.text_input if t.label == "Package size").input("1.5 L")
+    next(b for b in at.button if b.label == "Save" and b.proto.form_id == "add_purchase").click().run()
+    assert not at.exception, at.exception
+    item = svc.get_pantry(hh)[0]
+    assert item["product_id"] == milk.product_id and item["eff_units"] == 1.5

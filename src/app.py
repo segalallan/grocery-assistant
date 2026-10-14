@@ -17,6 +17,8 @@ from db import RESET_CODE_MINUTES
 from db import Database
 from engine import PantryDepletionEngine
 from i18n import make_translator
+from matcher import ProductMatcher
+from normalize import Size, extract_size, parse_size_text
 from notifications import send_reset_email
 from pantry_service import PantryService
 from text_parser import TextListParser
@@ -453,6 +455,22 @@ def cat_options_with(current):
 
 
 
+def product_labels(products: list[dict]) -> dict[int, str]:
+    """Readable, unique dropdown label per product id: 'Milk 3% · חלב 3%'."""
+    labels, seen = {}, {}
+    for p in products:
+        first, second = (p["name_he"], p["name_en"]) if is_he else (p["name_en"], p["name_he"])
+        first = first or second
+        lbl = first if not second or second == first else f"{first} · {second}"
+        seen[lbl] = seen.get(lbl, 0) + 1
+        labels[p["id"]] = lbl if seen[lbl] == 1 else f"{lbl} (#{p['id']})"
+    return labels
+
+
+def size_label(size) -> str:
+    return size.label("he" if is_he else "en") if size else ""
+
+
 def risk_color(p: float) -> str:
     if p >= RESTOCK_THRESHOLD:
         return "#D64545"
@@ -477,7 +495,8 @@ def render_pantry_row(it: dict, sel_ver: int):
             st.checkbox(f"**{it['display_name']}**{qty}", key=f"chk_{sel_ver}_{it['id']}", width="stretch")
             st.markdown(f"<span class='risk-pill' style='background:{color}1A;color:{color}'>{int(p * 100)}%</span>",
                         unsafe_allow_html=True, width="content")
-        meta = (f"🏷️ {it['category_display']} · {it['purchase_date']} ({it['days_elapsed']}d) · "
+        size_txt = f"📦 {size_label(it['size'])} · " if it.get("size") else ""
+        meta = (f"{size_txt}🏷️ {it['category_display']} · {it['purchase_date']} ({it['days_elapsed']}d) · "
                 + tr("lasts", d=round(it["effective_scale"])))
         badge_html = "".join(f"<span class='row-badge'>{b}</span>" for b in badges)
         st.markdown(
@@ -563,9 +582,17 @@ def edit_dialog(it):
         opts = cat_options_with(it["category"])
         e_cat = st.selectbox(tr("category"), opts, format_func=cat_fmt,
                              index=opts.index(it["category"]) if it["category"] in opts else 0)
+        ref_txt = size_label(it.get("ref_size"))
+        e_ref = st.text_input(tr("usual_size"), value=ref_txt, placeholder="1 L / 500 g / 12", help=tr("usual_size_help"))
         if st.form_submit_button(tr("update_btn"), type="primary"):
+            new_ref = parse_size_text(e_ref) if e_ref.strip() != ref_txt else None
+            if e_ref.strip() and e_ref.strip() != ref_txt and new_ref is None:
+                st.error(tr("size_bad"))
+                return
             e_en, e_he = fill_names(e_en, e_he)
             svc.update_item(household_id, it["id"], e_en, e_he, e_cat, e_qty)
+            if new_ref and it.get("product_id"):
+                svc.set_reference_size(household_id, it["product_id"], new_ref.amount, new_ref.unit)
             reset_selection()
             st.rerun()
 
@@ -596,7 +623,12 @@ tab_pantry, tab_shopping, tab_categories, tab_curves = st.tabs(
 # ==========================================================================
 with tab_pantry:
     with st.expander(tr("manual_add_pantry")):
+        all_products = svc.get_products(household_id)
+        p_labels = product_labels(all_products)
         with st.form("add_purchase", clear_on_submit=True):
+            p_pid = st.selectbox(tr("pick_product"), [None] + list(p_labels), index=0,
+                                 format_func=lambda x: tr("new_product") if x is None else p_labels[x])
+            st.caption(tr("pick_product_help"))
             c1, c2, c3 = st.columns([2, 2, 1])
             p_en = c1.text_input(tr("item_name_en"), placeholder="e.g. 3% Milk")
             p_cat = c1.selectbox(tr("category"), cat_keys, format_func=cat_fmt)
@@ -604,12 +636,20 @@ with tab_pantry:
             p_date = c2.date_input(tr("purchase_date"), value=today, max_value=today,
                                    min_value=today - timedelta(days=365))
             p_qty = c3.number_input(tr("units"), min_value=1, value=1, step=1)
+            p_size = c3.text_input(tr("size_col"), placeholder="1 L")
             if st.form_submit_button(tr("save_btn"), type="primary"):
-                if not (p_en.strip() or p_he.strip()):
+                size = parse_size_text(p_size)
+                if p_size.strip() and size is None:
+                    st.error(tr("size_bad"))
+                elif p_pid is not None:
+                    svc.record_purchase(household_id, "", "", None, int(p_qty), p_date, display_name,
+                                        product_id=p_pid, size=size)
+                    st.rerun()
+                elif not (p_en.strip() or p_he.strip()):
                     st.error(tr("need_name"))
                 else:
                     p_en, p_he = fill_names(p_en, p_he)
-                    svc.record_purchase(household_id, p_en, p_he, p_cat, int(p_qty), p_date, display_name)
+                    svc.record_purchase(household_id, p_en, p_he, p_cat, int(p_qty), p_date, display_name, size=size)
                     st.rerun()
 
     with st.expander(tr("audit")):
@@ -816,6 +856,30 @@ with tab_categories:
                 else:
                     st.error(tr("cat_in_use", n=n))
 
+    with st.expander(tr("products_title")):
+        prods = svc.get_products(household_id)
+        labels = product_labels(prods)
+        st.caption(tr("products_help"))
+        if prods:
+            st.dataframe(pd.DataFrame([{
+                tr("product_col"): labels[p["id"]],
+                tr("category"): cat_fmt(p["category"]),
+                tr("usual_size"): size_label(Size(p["ref_amount"], p["ref_unit"])) if p["ref_amount"] else "—",
+                tr("names_known"): p["alias_count"],
+            } for p in prods]), hide_index=True, width="stretch")
+        if len(prods) >= 2:
+            with st.form("merge_products"):
+                m1, m2 = st.columns(2)
+                drop = m1.selectbox(tr("merge_from"), list(labels), format_func=lambda x: labels[x])
+                keep_p = m2.selectbox(tr("merge_into"), list(labels), index=1, format_func=lambda x: labels[x])
+                if st.form_submit_button(tr("merge_btn")):
+                    if drop == keep_p:
+                        st.error(tr("merge_same"))
+                    else:
+                        svc.merge_products(household_id, keep_p, drop)
+                        st.success(tr("merged_ok"))
+                        st.rerun()
+
 # ==========================================================================
 # Tab 4: How it predicts
 # ==========================================================================
@@ -864,6 +928,16 @@ if st.sidebar.button(tr("process"), type="primary", disabled=not parser.availabl
         loader.markdown(cart_spinner_html(tr("quick_add_working")), unsafe_allow_html=True)
         try:
             parsed = parser.parse(pasted, categories)
+            products_now = svc.get_products(household_id)
+            by_id = {p["id"]: p for p in products_now}
+            suggestions = ProductMatcher(products_now, svc.get_aliases(household_id), parser).suggest(parsed)
+            for it, sug in zip(parsed, suggestions):
+                it["product_id"] = sug.product_id
+                it["match"] = sug.reason
+                _, sz = extract_size(it.get("raw_name"))
+                it["size"] = size_label(sz)
+                if sug.product_id:  # matched products keep their own names and category
+                    it["category"] = by_id[sug.product_id]["category"] or it.get("category")
             loader.empty()
             st.session_state["staged_items"] = parsed
             st.session_state["staged_date"] = paste_date
@@ -875,31 +949,60 @@ if st.sidebar.button(tr("process"), type="primary", disabled=not parser.availabl
 if st.session_state.get("staged_items"):
     st.divider()
     st.subheader(tr("verify_title"))
+    st.caption(tr("verify_help"))
+    rv_products = svc.get_products(household_id)
+    rv_labels = product_labels(rv_products)
+    label_to_id = {v: k for k, v in rv_labels.items()}
+    new_lbl = tr("new_product")
+    match_icon = {"alias": tr("match_alias"), "similar": tr("match_similar"), "ai": tr("match_ai"), "new": tr("match_new")}
+
     staged = pd.DataFrame(st.session_state["staged_items"])
     staged.insert(0, "include", True)
+    staged["product"] = [rv_labels.get(pid, new_lbl) if pid else new_lbl for pid in staged.get("product_id", [None] * len(staged))]
+    staged["match"] = staged.get("match", "new").map(lambda r: match_icon.get(r, r))
+    for col in ("raw_name", "size"):
+        if col not in staged:
+            staged[col] = ""
     edited = st.data_editor(
-        staged[["include", "name_en", "name_he", "category", "units"]],
+        staged[["include", "raw_name", "product", "units", "size", "match", "name_en", "name_he", "category"]],
         column_config={
             "include": st.column_config.CheckboxColumn(tr("keep"), default=True),
+            "raw_name": st.column_config.TextColumn(tr("line_col"), disabled=True),
+            "product": st.column_config.SelectboxColumn(tr("product_col"), options=[new_lbl] + list(rv_labels.values()),
+                                                         required=True, width="medium"),
+            "match": st.column_config.TextColumn(tr("match_col"), disabled=True, width="small"),
             "name_en": st.column_config.TextColumn(tr("item_name_en")),
             "name_he": st.column_config.TextColumn(tr("item_name_he")),
-            "category": st.column_config.SelectboxColumn(tr("category"), options=cat_keys, required=True),
+            "category": st.column_config.SelectboxColumn(tr("category"), options=cat_keys),
             "units": st.column_config.NumberColumn(tr("units"), min_value=1, step=1, default=1),
+            "size": st.column_config.TextColumn(tr("size_col"), help=tr("size_help")),
         },
         hide_index=True, width="stretch", key="staged_editor",
     )
     c1, c2 = st.columns(2)
     if c1.button(tr("commit"), type="primary"):
         keep = edited[edited["include"]].copy()
-        keep["name_en"] = keep["name_en"].fillna("").astype(str).str.strip()
-        keep["name_he"] = keep["name_he"].fillna("").astype(str).str.strip()
-        keep = keep[(keep["name_en"] != "") | (keep["name_he"] != "")]
-        missing = keep[keep["category"].isna() | ~keep["category"].isin(cat_keys)]
-        if not missing.empty:
-            st.error(tr("need_category", names=", ".join(missing["name_en"].fillna(missing["name_he"]))))
+        for col in ("name_en", "name_he", "raw_name", "size"):
+            keep[col] = keep[col].fillna("").astype(str).str.strip()
+        keep["pid"] = keep["product"].map(lambda lbl: label_to_id.get(lbl))
+        is_new = keep["pid"].isna()
+        nameless = keep[is_new & (keep["name_en"] == "") & (keep["name_he"] == "")]
+        missing = keep[is_new & (keep["category"].isna() | ~keep["category"].isin(cat_keys))]
+        bad_size = [r.raw_name or r.name_en for r in keep.itertuples() if r.size and parse_size_text(r.size) is None]
+        if not nameless.empty:
+            st.error(tr("need_name"))
+        elif not missing.empty:
+            st.error(tr("need_category", names=", ".join(missing["name_en"].where(missing["name_en"] != "", missing["name_he"]))))
+        elif bad_size:
+            st.error(tr("size_bad") + " " + ", ".join(bad_size))
         else:
-            records = [{"name_en": r.name_en, "name_he": r.name_he, "category": r.category,
-                        "units": int(r.units or 1)} for r in keep.itertuples()]
+            records = []
+            for r in keep.itertuples():
+                pid = None if pd.isna(r.pid) else int(r.pid)
+                en, he = (r.name_en, r.name_he) if pid else fill_names(r.name_en, r.name_he)
+                records.append({"product_id": pid, "name_en": en, "name_he": he, "category": r.category,
+                                "units": int(r.units or 1), "size": parse_size_text(r.size),
+                                "raw_name": r.raw_name or None})
             svc.record_purchases(household_id, records, st.session_state["staged_date"], display_name)
             st.session_state.pop("staged_items", None)
             st.toast(tr("saved_n", n=len(records)))

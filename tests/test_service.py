@@ -48,7 +48,7 @@ def test_repurchase_logs_per_item_interval(svc):
     assert res.status == "restocked"
     hist = history(svc)
     assert len(hist) == 1
-    assert hist[0]["item_key"] == "milk"
+    assert hist[0]["item_key"] == svc.get_pantry(h)[0]["item_key"]
     assert hist[0]["interval_days"] == pytest.approx(5.0)  # 10 days / 2 units
     assert len(svc.get_pantry(h)) == 1  # no duplicate rows
 

@@ -45,11 +45,12 @@ def test_v1_database_upgrades(tmp_path, monkeypatch):
     svc = PantryService(db, PantryDepletionEngine())
     assert db.authenticate("old@b.com", "pw") is not None  # old password hashes still work
     items = svc.get_pantry(hh)
-    assert items[0]["item_key"] == "milk"
+    key = items[0]["item_key"]
+    assert key.startswith("prod:") and items[0]["name_en"] == "Milk"   # migrated to a product
     # Legacy category-level history still informs the category estimate
-    assert svc.item_learning_stats(hh, "milk", "Dairy & Eggs")["category_cycles"] == 1
+    assert svc.item_learning_stats(hh, key, "Dairy & Eggs")["category_cycles"] == 1
     svc.record_purchase(hh, "Milk", "חלב", "Dairy & Eggs", 1, TODAY, "Old")
-    assert svc.item_learning_stats(hh, "milk", "Dairy & Eggs")["item_cycles"] == 1
+    assert svc.item_learning_stats(hh, key, "Dairy & Eggs")["item_cycles"] == 1
 
 
 class FakeSMTP:
@@ -159,7 +160,7 @@ def test_import_v1_sqlite_into_current_backend(backend, tmp_path, monkeypatch):
     assert target.authenticate("old@b.com", "pw")["household_name"] == "Old Home"
 
     svc = PantryService(target, PantryDepletionEngine())
-    assert svc.get_pantry(hh)[0]["item_key"] == "milk"
+    assert svc.get_pantry(hh)[0]["item_key"].startswith("prod:")
     ok, _ = target.create_user("new@b.com", "pw", "N", "U", household_name="New")  # ids don't collide
     assert ok
     with pytest.raises(RuntimeError):

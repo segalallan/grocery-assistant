@@ -27,7 +27,7 @@ RESET_MAX_ATTEMPTS = 5       # wrong guesses before the code is burned
 RESET_RESEND_SECONDS = 60    # minimum gap between codes for the same account
 SESSION_DAYS = 30            # how long "remember me" keeps someone logged in
 
-TABLES = ["households", "users", "household_categories", "inventory",
+TABLES = ["households", "users", "household_categories", "products", "product_aliases", "inventory",
           "purchase_history", "purchases", "shopping_list", "password_resets", "login_sessions"]  # dependency order
 
 
@@ -72,6 +72,25 @@ _SCHEMA = [
         name_en TEXT,
         name_he TEXT,
         UNIQUE(household_id, name_en)
+    )""",
+    # A household's products: what the model learns about. Brand and package size are not part of it.
+    """CREATE TABLE IF NOT EXISTS products (
+        id {pk},
+        household_id INTEGER REFERENCES households(id),
+        name_en TEXT,
+        name_he TEXT,
+        category TEXT,
+        ref_amount {real},        -- reference package size in base units (ml / g / pc); NULL = unknown
+        ref_unit TEXT,            -- 'ml' | 'g' | 'pc'
+        created_at TEXT
+    )""",
+    # Every way a product has been written ("חלב תנובה 3% 1 ל", "Milk"...), as a normalized match key.
+    """CREATE TABLE IF NOT EXISTS product_aliases (
+        id {pk},
+        household_id INTEGER REFERENCES households(id),
+        alias TEXT NOT NULL,
+        product_id INTEGER REFERENCES products(id),
+        UNIQUE(household_id, alias)
     )""",
     # Current stock: one row per item the household has on hand.
     """CREATE TABLE IF NOT EXISTS inventory (
@@ -145,12 +164,33 @@ _SCHEMA = [
 
 # Columns added after v1; applied to older databases.
 MIGRATION_COLUMNS = {
+    # eff_units = amount in "reference packages" (2 x 2 L with a 1 L reference = 4.0). NULL on old rows → use units.
     "users": {"email_alerts": "INTEGER DEFAULT 1", "email_lang": "TEXT DEFAULT 'en'"},
     "inventory": {"item_key": "TEXT", "confirmed_until": "TEXT", "last_alerted": "TEXT"},
     "purchase_history": {"item_key": "TEXT", "units": "INTEGER", "kind": "TEXT"},
     "purchases": {"item_key": "TEXT"},
     "shopping_list": {"item_key": "TEXT"},
 }
+# Amount tracking (added with products). REAL works on both SQLite and Postgres.
+for _t, _cols in {
+    "inventory": {"eff_units": "REAL", "size_amount": "REAL", "size_unit": "TEXT"},
+    "purchases": {"eff_units": "REAL", "size_amount": "REAL", "size_unit": "TEXT", "raw_name": "TEXT"},
+    "purchase_history": {"eff_units": "REAL"},
+}.items():
+    MIGRATION_COLUMNS.setdefault(_t, {}).update(_cols)
+
+PRODUCT_PREFIX = "prod:"
+
+
+def product_key(product_id: int) -> str:
+    """The item_key used everywhere (inventory, history, shopping list) for a product."""
+    return f"{PRODUCT_PREFIX}{int(product_id)}"
+
+
+def product_id_of(item_key: str | None) -> int | None:
+    if item_key and str(item_key).startswith(PRODUCT_PREFIX):
+        return int(str(item_key)[len(PRODUCT_PREFIX):])
+    return None
 
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_inv_hh_key ON inventory(household_id, item_key)",
@@ -159,6 +199,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_purch_hh_date ON purchases(household_id, purchase_date)",
     "CREATE INDEX IF NOT EXISTS ix_shop_hh ON shopping_list(household_id)",
     "CREATE INDEX IF NOT EXISTS ix_users_hh ON users(household_id)",
+    "CREATE INDEX IF NOT EXISTS ix_products_hh ON products(household_id)",
+    "CREATE INDEX IF NOT EXISTS ix_alias_hh ON product_aliases(household_id, alias)",
 ]
 
 
@@ -322,6 +364,39 @@ class Database:
             for r in rows:
                 conn.execute(f"UPDATE {table} SET item_key = ? WHERE id = ?",
                              (normalize_key(r["item_name_en"], r["item_name_he"]), r["id"]))
+        self._migrate_to_products(conn)
+
+    def _migrate_to_products(self, conn):
+        """Turn every name-based item_key into a product (one-time; safe to re-run).
+
+        Each distinct (household, item_key) becomes a product named after its most recent row,
+        aliases are recorded for its names, and all tables are re-pointed to "prod:<id>".
+        """
+        from normalize import match_key
+        tables = ("inventory", "purchases", "shopping_list")
+        legacy = {}
+        for table in tables:
+            for r in conn.execute(
+                    f"SELECT household_id, item_key, item_name_en, item_name_he, category, id FROM {table} "
+                    f"WHERE item_key IS NOT NULL AND item_key NOT LIKE 'prod:%' ORDER BY id").fetchall():
+                legacy[(r["household_id"], r["item_key"])] = (r["item_name_en"], r["item_name_he"], r["category"])
+        for r in conn.execute(
+                "SELECT DISTINCT household_id, item_key, category FROM purchase_history "
+                "WHERE item_key IS NOT NULL AND item_key NOT LIKE 'prod:%'").fetchall():
+            legacy.setdefault((r["household_id"], r["item_key"]), (r["item_key"], None, r["category"]))
+        now = datetime.now(timezone.utc).isoformat()
+        for (hh, key), (en, he, cat) in legacy.items():
+            pid = conn.execute(
+                "INSERT INTO products (household_id, name_en, name_he, category, created_at) "
+                "VALUES (?, ?, ?, ?, ?) RETURNING id", (hh, en, he, cat, now)).fetchone()[0]
+            for text in {en, he, key}:
+                k = match_key(text)
+                if k:
+                    conn.execute("INSERT INTO product_aliases (household_id, alias, product_id) VALUES (?, ?, ?) "
+                                 "ON CONFLICT DO NOTHING", (hh, k, pid))
+            for table in tables + ("purchase_history",):
+                conn.execute(f"UPDATE {table} SET item_key = ? WHERE household_id = ? AND item_key = ?",
+                             (product_key(pid), hh, key))
 
     # ---------- one-time data copy ----------
     def is_empty(self) -> bool:

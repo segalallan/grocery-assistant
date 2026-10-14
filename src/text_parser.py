@@ -100,7 +100,11 @@ class TextListParser:
         valid = [c["en"] for c in categories]
         cats_formatted = "\n".join(f'- "{c["en"]}" (Hebrew: {c["he"]})' for c in categories)
         prompt = f"""Convert this grocery list (Hebrew and/or English) into structured items.
-Each line is usually one item. Keep quantities like "2 milk" as units = 2.
+Each line is usually one item.
+- "units" is the number of packages ("2 milk" → 2). A package SIZE like "1 ליטר", "500 גרם", "1.5L" is NOT units.
+- "line" is the item's original text exactly as written, including any size.
+- Names are generic product names without brand or package size (e.g. "חלב תנובה 3% 1 ל" → "3% Milk" / "חלב 3%").
+  Keep meaningful variants such as fat %, flavor or type.
 
 LIST:
 {raw_text}
@@ -108,7 +112,7 @@ LIST:
 Use ONLY these category keys (copy the English key exactly):
 {cats_formatted}
 
-Return JSON: {{"items": [{{"item_name_en": "English name", "item_name_he": "Hebrew name",
+Return JSON: {{"items": [{{"line": "original text", "item_name_en": "English name", "item_name_he": "Hebrew name",
 "category": "Category key", "units": 1}}]}}"""
 
         try:
@@ -135,9 +139,41 @@ Return JSON: {{"items": [{{"item_name_en": "English name", "item_name_he": "Hebr
             except (TypeError, ValueError):
                 units = 1
             items.append({
+                "raw_name": str(it.get("line") or "").strip() or (he or en),
                 "name_en": en or he,
                 "name_he": he or en,
                 "category": cat if cat in valid else None,  # user must pick one before committing
                 "units": units,
             })
         return items
+
+    def choose_products(self, requests: list[dict]) -> dict[int, int | None]:
+        """For each unclear line, pick one of its candidate products or None (= a new product).
+
+        requests: [{"i", "line", "en", "he", "candidates": [{"id","en","he","category"}]}]
+        Returns {i: product_id or None}. Empty dict on any failure (callers fall back to similarity).
+        """
+        if not requests or not self.available:
+            return {}
+        prompt = (
+            "You match grocery lines to a household's existing products.\n"
+            "Rules: the SAME product regardless of brand or package size (Tnuva vs Tara milk, 1 L vs 2 L). "
+            "DIFFERENT products when a meaningful variant differs (3% vs 1% milk, plain vs strawberry yogurt, "
+            "white vs whole-wheat bread). If none of the candidates is the same product, answer null.\n"
+            'Return JSON {"matches": [{"i": <i>, "product_id": <candidate id or null>}]}.\n'
+            + json.dumps(requests, ensure_ascii=False))
+        try:
+            resp = self._get_client().chat.completions.create(
+                model=MODEL, response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": prompt}], temperature=0.0)
+            data = json.loads(resp.choices[0].message.content)
+        except Exception:
+            log.exception("Product matching failed; falling back to similarity")
+            return {}
+        allowed = {r["i"]: {c["id"] for c in r["candidates"]} for r in requests}
+        out = {}
+        for m in data.get("matches", []):
+            i, pid = m.get("i"), m.get("product_id")
+            if i in allowed:
+                out[i] = pid if pid in allowed[i] else None
+        return out

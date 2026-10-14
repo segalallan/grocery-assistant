@@ -113,7 +113,8 @@ class PantryDepletionEngine:
     # ---------- prediction ----------
     def effective_scale(self, category: str | None, per_unit_scale: float | None, units: int) -> float:
         base = per_unit_scale if per_unit_scale and per_unit_scale > 0 else self.prior_scale(category)
-        return float(base) * max(1, int(units or 1))
+        # units may be fractional (e.g. 0.5 = half a reference package)
+        return float(base) * max(0.05, float(units or 1))
 
     def depletion_probability(self, category: str | None, days_elapsed: float,
                               per_unit_scale: float | None = None, units: int = 1,
