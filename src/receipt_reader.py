@@ -685,6 +685,24 @@ def barcode_ok(code: str) -> bool | None:
     return (10 - s % 10) % 10 == check
 
 
+CHAINS = [  # (display name, keywords). Only these names are ever stored in scan statistics.
+    ("Osher Ad", ["אושר עד", "osher"]), ("Shufersal", ["שופרסל", "shufersal"]),
+    ("Rami Levy", ["רמי לוי", "rami levy"]), ("Victory", ["ויקטורי", "victory"]),
+    ("Yochananof", ["יוחננוף", "yochananof"]), ("Carrefour", ["קרפור", "carrefour"]),
+    ("Yeinot Bitan", ["יינות ביתן", "bitan"]), ("Tiv Taam", ["טיב טעם", "tiv taam"]),
+    ("Hatzi Hinam", ["חצי חינם", "hatzi"]), ("Mega", ["מגה", "mega"]), ("Super-Pharm", ["סופר-פארם", "סופר פארם", "super-pharm"]),
+    ("AM:PM", ["am:pm", "am pm", "איי אם"]), ("Tiv Taam", ["tiv-taam"]), ("Machsanei HaShuk", ["מחסני השוק"]),
+]
+
+
+def chain_name(store: str | None) -> str:
+    s = (store or "").lower()
+    for name, keys in CHAINS:
+        if any(k in s for k in keys):
+            return name
+    return "Other" if s else "Unknown"
+
+
 def parse_receipt_date(text) -> str | None:
     """'17/09/26', '27.08.2026', '2026-08-27' → '2026-08-27'. Israeli receipts are day/month/year."""
     from datetime import date as _date

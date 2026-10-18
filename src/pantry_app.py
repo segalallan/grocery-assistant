@@ -6,6 +6,7 @@ so every way of adding or using up an item feeds the learning model.
 import logging
 import os
 import re
+import time
 from datetime import date, timedelta
 
 import pandas as pd
@@ -21,7 +22,7 @@ from matcher import ProductMatcher
 from normalize import Size, extract_size, parse_size_text
 from notifications import send_reset_email
 from pantry_service import PantryService
-from receipt_reader import ReceiptError, ReceiptReader, code_alias
+from receipt_reader import ReceiptError, ReceiptReader, chain_name, code_alias
 from text_parser import TextListParser
 from ui_theme import apply_theme, cart_spinner_html
 
@@ -808,25 +809,56 @@ def render_review():
             else:
                 records = []
                 originals = st.session_state["staged_items"]
+                before = st.session_state.get("staged_original") or []
+                rematched = changed = 0
                 for r in keep.itertuples():
                     pid = None if pd.isna(r.pid) else int(r.pid)
+                    if r.Index < len(before):
+                        b = before[r.Index]
+                        rematched += pid != (int(b["product_id"]) if b.get("product_id") else None)
+                        changed += any(str(getattr(r, f) if not pd.isna(getattr(r, f)) else "").strip()
+                                       != str(b.get(f) or "").strip() for f in ("name_en", "name_he", "size")) \
+                            or int(r.units or 1) != int(b.get("units") or 1) \
+                            or (pid is None and r.category != b.get("category"))
                     en, he = (r.name_en, r.name_he) if pid else fill_names(r.name_en, r.name_he)
                     code_key = originals[r.Index].get("code_key") if r.Index < len(originals) else None
                     records.append({"product_id": pid, "name_en": en, "name_he": he, "category": r.category,
                                     "units": int(r.units or 1), "size": parse_size_text(r.size),
                                     "raw_name": r.raw_name or None, "aliases": [code_key] if code_key else []})
                 svc.record_purchases(household_id, records, st.session_state["staged_date"], display_name)
+                finish_scan("saved", kept=len(records), unticked=len(edited) - len(records),
+                            rematched=rematched, edited=changed)
                 clear_staged()
                 st.toast(tr("saved_n", n=len(records)))
                 st.rerun()
         if c2.button(tr("discard")):
+            finish_scan("discarded", kept=0, unticked=len(edited))
             clear_staged()
             st.rerun()
 
 
 def clear_staged():
-    for k in ("staged_items", "staged_source", "receipt_summary"):
+    for k in ("staged_items", "staged_source", "receipt_summary", "receipt_scan_id", "staged_original"):
         st.session_state.pop(k, None)
+
+
+REVIEW_FIELDS = ("product_id", "units", "size", "name_en", "name_he", "category")
+
+
+def log_scan(**fields):
+    """Scanner reliability stats for the admin view. Never blocks or breaks a scan."""
+    try:
+        return db.log_receipt_scan(**fields)
+    except Exception:
+        log.exception("Couldn't log the receipt scan")
+        return None
+
+
+def finish_scan(outcome, **counts):
+    try:
+        db.finish_receipt_scan(st.session_state.get("receipt_scan_id"), outcome, **counts)
+    except Exception:
+        log.exception("Couldn't update the receipt scan")
 
 
 def render_receipt_summary():
@@ -863,13 +895,18 @@ def render_receipt_tab():
                  help=None if reader.available else "Set OPENAI_API_KEY to enable"):
         loader = st.empty()
         loader.markdown(cart_spinner_html(tr("receipt_working")), unsafe_allow_html=True)
+        data, t0 = up.getvalue(), time.time()
+        source = "pdf" if data[:5] == b"%PDF-" or up.name.lower().endswith(".pdf") else "photo"
         try:
-            res = reader.read(up.getvalue(), up.name)
+            res = reader.read(data, up.name)
             if not res.lines:
                 raise ReceiptError("nothing")
             names = get_parser().describe_lines([ln.text for ln in res.lines], categories)
         except ReceiptError as e:
             loader.empty()
+            if str(e) in ("api", "nothing"):     # the scanner itself failed (not a bad file)
+                log_scan(source=source, model=reader.model, calls=reader.calls,
+                         seconds=round(time.time() - t0, 1), lines=0, outcome="failed")
             st.error(tr(f"receipt_err_{e}") if f"receipt_err_{e}" in I18N_KEYS else tr("receipt_err_api"))
             return
         items = []
@@ -890,9 +927,17 @@ def render_receipt_tab():
         except ValueError:
             r_date = today
         loader.empty()
+        clear_staged()
         st.session_state["staged_items"] = items
+        st.session_state["staged_original"] = [{k: it.get(k) for k in REVIEW_FIELDS} for it in items]
         st.session_state["staged_date"] = r_date if r_date <= today else today
         st.session_state["staged_source"] = "receipt"
+        st.session_state["receipt_scan_id"] = log_scan(
+            source=source, chain=chain_name(res.store), model=reader.model, images=res.images, calls=res.calls,
+            seconds=round(time.time() - t0, 1), lines=len(res.lines), merged=res.merged, repaired=res.fixed,
+            rechecked=res.rechecked, has_total=res.total is not None, sum_ok=not res.sum_mismatch,
+            gap_pct=round(abs(res.missing_amount) / res.total * 100, 1) if res.total else None,
+            has_count=res.item_count is not None, count_ok=not res.count_mismatch)
         st.session_state["receipt_summary"] = {
             "lines": len(res.lines), "store": res.store, "total": res.total, "rows_sum": res.rows_sum,
             "missing": res.missing_amount, "item_count": res.item_count, "counted": res.counted,
@@ -1214,6 +1259,65 @@ with tab_curves:
 # ==========================================================================
 # Tab 5: Admin (only for ADMIN_EMAILS)
 # ==========================================================================
+def _pct(part, whole):
+    return f"{100 * part / whole:.0f}%" if whole else "—"
+
+
+def render_scanner_stats():
+    """Receipt scanner reliability. Built only from receipt_scans: no contents, amounts or identities."""
+    st.markdown(f"**{tr('adm_scanner')}**")
+    scans = db.receipt_scans((today - timedelta(days=30)).isoformat())
+    if not scans:
+        st.caption(tr("adm_scanner_none"))
+        return
+    read = [x for x in scans if x["outcome"] != "failed"]
+    totals = [x for x in read if x["has_total"]]
+    counts = [x for x in read if x["has_count"]]
+    reviewed = [x for x in read if x["outcome"] in ("saved", "discarded")]
+    saved = [x for x in read if x["outcome"] == "saved"]
+    fixed_lines = sum((x["unticked"] or 0) + (x["rematched"] or 0) + (x["edited"] or 0) for x in saved)
+    saved_lines = sum(x["lines"] or 0 for x in saved)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(tr("adm_scans"), len(scans), help=tr("adm_scans_help"))
+    m2.metric(tr("adm_adds_up"), _pct(sum(x["sum_ok"] for x in totals), len(totals)), help=tr("adm_adds_up_help"))
+    m3.metric(tr("adm_count_ok"), _pct(sum(x["count_ok"] for x in counts), len(counts)))
+    m4.metric(tr("adm_corrected"), _pct(fixed_lines, saved_lines), help=tr("adm_corrected_help"))
+    secs = sorted(x["seconds"] for x in read if x["seconds"] is not None)
+    st.caption(tr("adm_scanner_line",
+                  second=_pct(sum(bool(x["rechecked"]) for x in read), len(read)),
+                  repaired=_pct(sum(bool(x["repaired"]) for x in read), len(read)),
+                  failed=len(scans) - len(read),
+                  secs=f"{secs[len(secs) // 2]:.0f}" if secs else "—",
+                  discarded=sum(1 for x in reviewed if x["outcome"] == "discarded")))
+    groups = {}
+    for x in read:
+        groups.setdefault((x["source"] or "?", x["chain"] or "?"), []).append(x)
+    rows = []
+    for (source, chain), xs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        t = [x for x in xs if x["has_total"]]
+        sv = [x for x in xs if x["outcome"] == "saved"]
+        rows.append({tr("adm_source"): tr("adm_pdf") if source == "pdf" else tr("adm_photo"), tr("adm_chain"): chain,
+                     tr("adm_scans"): len(xs), tr("adm_adds_up"): _pct(sum(x["sum_ok"] for x in t), len(t)),
+                     tr("adm_count_ok"): _pct(sum(x["count_ok"] for x in xs if x["has_count"]),
+                                              sum(1 for x in xs if x["has_count"])),
+                     tr("adm_corrected"): _pct(sum((x["unticked"] or 0) + (x["rematched"] or 0) + (x["edited"] or 0)
+                                                   for x in sv), sum(x["lines"] or 0 for x in sv))})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    with st.expander(tr("adm_recent_scans")):
+        st.dataframe(pd.DataFrame([{
+            tr("adm_when"): x["scanned_on"], tr("adm_source"): tr("adm_pdf") if x["source"] == "pdf" else tr("adm_photo"),
+            tr("adm_chain"): x["chain"] or "—", tr("adm_lines"): x["lines"],
+            tr("adm_total_col"): "—" if not x["has_total"] else ("✓" if x["sum_ok"] else f"✗ {x['gap_pct'] or 0:g}%"),
+            tr("adm_count_col"): "—" if not x["has_count"] else ("✓" if x["count_ok"] else "✗"),
+            tr("adm_second"): "✓" if x["rechecked"] else "", tr("adm_repaired"): str(x["repaired"]) if x["repaired"] else "",
+            tr("adm_outcome"): tr(f"adm_out_{x['outcome']}") if x["outcome"] else tr("adm_out_open"),
+            tr("adm_user_fixes"): "" if x["outcome"] != "saved" else
+                f"{x['unticked'] or 0} / {x['rematched'] or 0} / {x['edited'] or 0}",
+        } for x in reversed(scans[-30:])]), hide_index=True, width="stretch")
+        st.caption(tr("adm_user_fixes_help"))
+    st.caption(tr("adm_scanner_privacy"))
+
+
 if tab_admin is not None:
     with tab_admin:
         stats = db.admin_stats(today.isoformat())
@@ -1229,6 +1333,7 @@ if tab_admin is not None:
             tr("adm_buys_30d"): r["buys_30d"], tr("adm_cycles"): r["cycles"], tr("adm_last"): r["last_purchase"] or "—",
         } for r in stats]), hide_index=True, width="stretch")
         st.caption(tr("adm_cycles_help"))
+        render_scanner_stats()
 
         st.markdown(f"**{tr('adm_feedback')}**")
         fb = db.list_feedback(50)

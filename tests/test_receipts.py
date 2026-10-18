@@ -532,3 +532,70 @@ def test_receipt_review_shows_check_and_saves_codes(app_env):
     assert banana["size"].amount == 940
     assert banana["days_elapsed"] == 2                               # the receipt's date, not today
     assert "staged_items" not in at.session_state and "receipt_summary" not in at.session_state
+
+
+# ---------------------------------------------------------------- admin reliability stats
+def test_scan_stats_store_no_personal_data(backend):
+    db = backend()
+    scan = db.log_receipt_scan(source="pdf", chain="Osher Ad", model="m", images=5, calls=1, seconds=12.5,
+                               lines=40, merged=2, repaired=1, rechecked=False, has_total=True, sum_ok=True,
+                               gap_pct=0.0, has_count=True, count_ok=True)
+    db.finish_receipt_scan(scan, "saved", kept=39, unticked=1, rematched=2, edited=3)
+    db.finish_receipt_scan(scan, "discarded")                     # first outcome wins
+    rows = db.receipt_scans("2000-01-01")
+    assert len(rows) == 1 and rows[0]["outcome"] == "saved" and rows[0]["rematched"] == 2
+    assert set(rows[0]) == {"id", "scanned_on", "source", "chain", "model", "images", "calls", "seconds", "lines",
+                            "merged", "repaired", "rechecked", "has_total", "sum_ok", "gap_pct", "has_count",
+                            "count_ok", "outcome", "kept", "unticked", "rematched", "edited"}
+    # nothing that identifies a person or what they bought: no user/household, items, prices or amounts
+
+
+def test_chain_names_come_from_a_fixed_list():
+    from receipt_reader import chain_name
+    assert chain_name("אושר עד") == "Osher Ad" and chain_name("Carrefour city") == "Carrefour"
+    assert chain_name("מכולת של יוסי, רחוב הרצל 5") == "Other"         # free text never stored
+    assert chain_name("") == "Unknown"
+
+
+def test_saved_receipt_review_records_corrections(app_env):
+    from config import today
+    at = _logged_in(app_env)
+    scan = app_env.log_receipt_scan(source="photo", chain="Carrefour", lines=2, has_total=True, sum_ok=True,
+                                    has_count=True, count_ok=False)
+    items = [
+        {"raw_name": "בננה", "name_en": "Banana", "name_he": "בננה", "category": "Produce", "units": 1,
+         "size": "0.94 kg", "price": 8.37, "product_id": None, "match": "new", "code_key": None},
+        {"raw_name": "חלב", "name_en": "Milk", "name_he": "חלב", "category": "Dairy & Eggs", "units": 2,
+         "size": "", "price": 14.70, "product_id": None, "match": "new", "code_key": None},
+    ]
+    at.session_state["staged_items"] = items
+    # what the scanner originally proposed: the milk was matched to product 999 and named differently
+    at.session_state["staged_original"] = [
+        {"product_id": None, "units": 1, "size": "0.94 kg", "name_en": "Banana", "name_he": "בננה", "category": "Produce"},
+        {"product_id": 999, "units": 2, "size": "", "name_en": "Homogenized milk", "name_he": "חלב", "category": "Dairy & Eggs"},
+    ]
+    at.session_state["staged_date"] = today()
+    at.session_state["staged_source"] = "receipt"
+    at.session_state["receipt_scan_id"] = scan
+    at.session_state["receipt_summary"] = {"lines": 2, "store": "", "total": 23.07, "rows_sum": 23.07, "missing": 0,
+                                           "item_count": 3, "counted": 3, "sum_off": False, "count_off": False,
+                                           "merged": 0, "deposits": 0}
+    at.run()
+    next(b for b in at.button if b.label == "✅ Save to pantry").click().run()
+    assert not at.exception, at.exception
+    row = app_env.receipt_scans("2000-01-01")[0]
+    assert (row["outcome"], row["kept"], row["unticked"], row["rematched"], row["edited"]) == ("saved", 2, 0, 1, 1)
+
+
+def test_admin_sees_scanner_reliability(app_env, monkeypatch):
+    monkeypatch.setenv("ADMIN_EMAILS", "a@b.com")
+    for ok in (True, True, False):
+        s = app_env.log_receipt_scan(source="pdf", chain="Osher Ad", lines=40, has_total=True, sum_ok=ok,
+                                     gap_pct=0 if ok else 2.5, has_count=True, count_ok=ok, seconds=20, rechecked=not ok)
+        app_env.finish_receipt_scan(s, "saved", kept=40, unticked=0, rematched=1, edited=1)
+    app_env.log_receipt_scan(source="photo", lines=0, outcome="failed")
+    at = _logged_in(app_env).run()
+    assert not at.exception, at.exception
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Scans"] == "4" and metrics["Adds up exactly"] == "67%" and metrics["Lines users fixed"] == "5%"
+    assert any("no receipt contents" in c.value for c in at.caption)

@@ -29,7 +29,7 @@ SESSION_DAYS = 30            # how long "remember me" keeps someone logged in
 
 TABLES = ["households", "users", "household_categories", "products", "product_aliases", "inventory",
           "purchase_history", "purchases", "shopping_list", "password_resets", "login_sessions",
-          "feedback", "app_errors"]  # dependency order
+          "feedback", "app_errors", "receipt_scans"]  # dependency order
 
 
 def normalize_key(name_en: str | None, name_he: str | None = None) -> str:
@@ -150,6 +150,32 @@ _SCHEMA = [
         message TEXT NOT NULL,
         context TEXT,
         created_at TEXT NOT NULL
+    )""",
+    # How each receipt scan went, for the admin view. Deliberately NOT stored: who scanned, item names,
+    # prices or amounts, and the image. The money check is kept only as a percentage gap.
+    """CREATE TABLE IF NOT EXISTS receipt_scans (
+        id {pk},
+        scanned_on TEXT NOT NULL,   -- date only
+        source TEXT,                -- 'pdf' | 'photo'
+        chain TEXT,                 -- one of a fixed list of chains, or 'Other'
+        model TEXT,
+        images INTEGER,
+        calls INTEGER,
+        seconds {real},
+        lines INTEGER,
+        merged INTEGER,
+        repaired INTEGER,
+        rechecked INTEGER,
+        has_total INTEGER,
+        sum_ok INTEGER,
+        gap_pct {real},
+        has_count INTEGER,
+        count_ok INTEGER,
+        outcome TEXT,               -- 'saved' | 'discarded' | 'failed' | NULL (left open)
+        kept INTEGER,
+        unticked INTEGER,
+        rematched INTEGER,
+        edited INTEGER
     )""",
     # Unexpected errors, one row per distinct error (signature), with a running count.
     """CREATE TABLE IF NOT EXISTS app_errors (
@@ -663,6 +689,32 @@ class Database:
                          "traceback = ?" + (", last_notified = ?" if notify else "") + " WHERE id = ?",
                          (iso, user, message[:1000], tb[-8000:], *([iso] if notify else []), row["id"]))
             return notify
+
+    # ---------- receipt scanner reliability (no receipt contents, no user identity) ----------
+    SCAN_FIELDS = ("source", "chain", "model", "images", "calls", "seconds", "lines", "merged", "repaired",
+                   "rechecked", "has_total", "sum_ok", "gap_pct", "has_count", "count_ok", "outcome")
+
+    def log_receipt_scan(self, **fields) -> int:
+        cols = [c for c in self.SCAN_FIELDS if c in fields]
+        vals = [int(v) if isinstance(v, bool) else v for v in (fields[c] for c in cols)]
+        with self.connect() as conn:
+            return conn.execute(
+                f"INSERT INTO receipt_scans (scanned_on, {', '.join(cols)}) VALUES (?{', ?' * len(cols)}) RETURNING id",
+                (datetime.now(timezone.utc).date().isoformat(), *vals)).fetchone()[0]
+
+    def finish_receipt_scan(self, scan_id, outcome, kept=0, unticked=0, rematched=0, edited=0):
+        """What the user did with the scan in the review table (counts only)."""
+        if not scan_id:
+            return
+        with self.connect() as conn:
+            conn.execute("UPDATE receipt_scans SET outcome = ?, kept = ?, unticked = ?, rematched = ?, edited = ? "
+                         "WHERE id = ? AND outcome IS NULL",
+                         (outcome, kept, unticked, rematched, edited, scan_id))
+
+    def receipt_scans(self, since_iso: str) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM receipt_scans WHERE scanned_on >= ? ORDER BY id", (since_iso,)).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
 
     def list_errors(self, limit=50):
         with self.connect() as conn:
