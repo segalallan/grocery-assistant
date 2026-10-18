@@ -304,8 +304,12 @@ class PantryService:
     # Purchases & consumption events
     # ======================================================================
     def record_purchase(self, household_id, name_en, name_he, category, units, purchase_date, user,
-                        conn=None, product_id=None, size=None, raw_name=None) -> PurchaseResult:
-        """Log a purchase of `units` packages. Size is parsed from the names unless given."""
+                        conn=None, product_id=None, size=None, raw_name=None, aliases=()) -> PurchaseResult:
+        """Log a purchase of `units` packages. Size is parsed from the names unless given.
+
+        `raw_name` (the text as written) and `aliases` (e.g. a receipt item code) are remembered
+        as aliases of the product, so the same line matches automatically next time.
+        """
         clean_en, size_en = extract_size((name_en or "").strip())
         clean_he, size_he = extract_size((name_he or "").strip())
         size = _as_size(size) or size_en or size_he
@@ -321,9 +325,9 @@ class PantryService:
         if conn is None:
             with self.db.connect() as own:
                 return self.record_purchase(household_id, name_en, name_he, category, units, p_date, user,
-                                            own, product_id, size, raw_name)
+                                            own, product_id, size, raw_name, aliases)
 
-        extra = [raw_name] if raw_name else []
+        extra = ([raw_name] if raw_name else []) + [a for a in (aliases or ()) if a]
         pid = self.resolve_product(conn, household_id, clean_en, clean_he, category, size,
                                    product_id=product_id, extra_aliases=extra)
         p = self._product(conn, household_id, pid)
@@ -380,7 +384,7 @@ class PantryService:
     def record_purchases(self, household_id, items, purchase_date, user) -> list[PurchaseResult]:
         """Batch version for Quick Add / receipts; all-or-nothing.
 
-        Each item: name_en, name_he, category, units, and optionally product_id, size, raw_name.
+        Each item: name_en, name_he, category, units, and optionally product_id, size, raw_name, aliases.
         """
         results = []
         with self.db.connect() as conn:
@@ -388,7 +392,8 @@ class PantryService:
                 results.append(self.record_purchase(
                     household_id, it.get("name_en"), it.get("name_he"), it.get("category"),
                     it.get("units", 1), purchase_date, user, conn,
-                    product_id=it.get("product_id"), size=it.get("size"), raw_name=it.get("raw_name")))
+                    product_id=it.get("product_id"), size=it.get("size"), raw_name=it.get("raw_name"),
+                    aliases=it.get("aliases") or ()))
         return results
 
     def mark_depleted(self, household_id, inventory_ids, on_date, user, add_to_list=True) -> int:

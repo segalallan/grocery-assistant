@@ -22,14 +22,14 @@ Code lives in `src/`; priors in `data/`. Run commands from the project folder.
 | `pantry_service.py` | All business logic: purchases, "ran out", "still have it", shopping list. |
 | `engine.py` | Weibull depletion math. Pure functions, no I/O. |
 | `db.py` | Connections, schema + automatic migrations, accounts, categories. |
-| `text_parser.py` | Quick Add: pasted list → items (OpenAI). |
+| `text_parser.py` | Quick Add: pasted list → items; naming receipt lines (OpenAI). |
+| `receipt_reader.py` | Receipt photo/PDF → purchase lines: vision transcription + checks against the printed total. |
 | `notifications.py`, `src/jobs/send_alerts.py` | Daily email alerts, run headless on a schedule. |
 | `src/normalize.py`, `src/matcher.py` | Item names → products: size parsing, alias/fuzzy/AI matching. |
 | `config.py` | Paths, threshold, timezone, secrets lookup. |
 | `i18n.py` | English / Hebrew strings. |
 | `data/category_priors.json` | Typical per-unit lifetime (median days) and shape per category. |
-| `notebooks/` | Offline survival-analysis scripts (not deployed). |
-| `src/future/receipt_ocr.py` | Parked receipt OCR for v2 (not imported). |
+| `notebooks/` | Offline analysis: model backtest (`evaluate_model`), receipt accuracy (`eval_receipts.py`). Not deployed. |
 
 ## How learning works
 
@@ -40,6 +40,24 @@ population prior*, so a new item starts sensible and quickly becomes yours.
 
 **Still have it** never moves the purchase date. It stores `confirmed_until`, and the risk
 becomes conditional: P(gone by today | was there on the confirmed date).
+
+## Receipts
+
+📷 **Scan receipt** accepts a phone photo (JPG/PNG/HEIC) or a digital receipt PDF.
+
+1. **Transcribe** (`OPENAI_VISION_MODEL`, default `gpt-4.1-mini`, falls back to `gpt-4o-mini`): every printed
+   row is copied as-is (code, text, qty or kg, line price, kind). Long receipts are sliced through blank
+   gaps between rows so text stays large; PDF pages are rendered as images (their text layer is unreliable).
+2. **Assemble** (plain Python): deal notes dropped, deposits kept out of the pantry, credits netted into
+   their item, repeated lines merged, weights become package sizes.
+3. **Check**: line prices must add up to the printed total, and units (weighed item = 1, deposits
+   included) must equal the printed item count. If not, the model gets a second look told exactly
+   how far off it was; anything still off is shown as a warning above the review table.
+4. Lines are named and categorized one-to-one, matched to products (item **codes** are remembered
+   as aliases, so a barcode matches instantly next time), and confirmed by the user as usual.
+
+Accuracy on real receipts: put receipts and hand transcriptions (`<name>.truth.json`) in
+`data/receipts/` (gitignored) and run `python notebooks/eval_receipts.py` with `OPENAI_API_KEY` set.
 
 ## Database
 

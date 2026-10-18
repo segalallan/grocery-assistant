@@ -6,7 +6,7 @@ so every way of adding or using up an item feeds the learning model.
 import logging
 import os
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -16,11 +16,12 @@ from config import DB_PATH, RESTOCK_THRESHOLD, today as app_today
 from db import RESET_CODE_MINUTES
 from db import Database
 from engine import PantryDepletionEngine
-from i18n import make_translator
+from i18n import T as I18N_KEYS, make_translator
 from matcher import ProductMatcher
 from normalize import Size, extract_size, parse_size_text
 from notifications import send_reset_email
 from pantry_service import PantryService
+from receipt_reader import ReceiptError, ReceiptReader, code_alias
 from text_parser import TextListParser
 from ui_theme import apply_theme, cart_spinner_html
 
@@ -169,7 +170,13 @@ def _google_user():
 
 
 def _apply_cookie_ops():
-    """Set or clear the remember-me cookie in the browser (runs once, after login/logout)."""
+    """Set or clear the remember-me cookie in the browser (runs once, after login/logout).
+
+    The script goes into a slot that is created on EVERY run. If the element only existed on
+    the first run after login, everything below it would shift by one position and the browser
+    could keep showing stale elements (e.g. the intro card after "Got it").
+    """
+    slot = st.container(key="cookie_slot")
     op = st.session_state.pop("_cookie_op", None)
     if not op:
         return
@@ -177,7 +184,7 @@ def _apply_cookie_ops():
         value, max_age = op[1], 60 * 60 * 24 * 30
     else:
         value, max_age = "", 0
-    st.html(
+    slot.html(
         f"""<script>
         document.cookie = "{SESSION_COOKIE}={value}; Max-Age={max_age}; Path=/; SameSite=Lax"
             + (location.protocol === "https:" ? "; Secure" : "");
@@ -728,8 +735,10 @@ def render_paste_list():
                     if sug.product_id:  # matched products keep their own names and category
                         it["category"] = by_id[sug.product_id]["category"] or it.get("category")
                 loader.empty()
+                clear_staged()
                 st.session_state["staged_items"] = parsed
                 st.session_state["staged_date"] = paste_date
+                st.session_state["staged_source"] = "paste"
                 st.rerun()
             except RuntimeError as e:
                 loader.empty()
@@ -746,6 +755,12 @@ def render_review():
         new_lbl = tr("new_product")
         match_icon = {"alias": tr("match_alias"), "similar": tr("match_similar"), "ai": tr("match_ai"), "new": tr("match_new")}
 
+        from_receipt = st.session_state.get("staged_source") == "receipt"
+        if from_receipt:
+            render_receipt_summary()
+            st.session_state["staged_date"] = st.date_input(
+                tr("purchase_date"), value=st.session_state["staged_date"], max_value=today, key="receipt_date_pick")
+
         staged = pd.DataFrame(st.session_state["staged_items"])
         staged.insert(0, "include", True)
         staged["product"] = [rv_labels.get(pid, new_lbl) if pid else new_lbl for pid in staged.get("product_id", [None] * len(staged))]
@@ -753,8 +768,11 @@ def render_review():
         for col in ("raw_name", "size"):
             if col not in staged:
                 staged[col] = ""
+        cols = ["include", "raw_name", "product", "units", "size", "match", "name_en", "name_he", "category"]
+        if "price" in staged and staged["price"].notna().any():
+            cols.insert(5, "price")
         edited = st.data_editor(
-            staged[["include", "raw_name", "product", "units", "size", "match", "name_en", "name_he", "category"]],
+            staged[cols],
             column_config={
                 "include": st.column_config.CheckboxColumn(tr("keep"), default=True),
                 "raw_name": st.column_config.TextColumn(tr("line_col"), disabled=True),
@@ -766,8 +784,10 @@ def render_review():
                 "category": st.column_config.SelectboxColumn(tr("category"), options=cat_keys),
                 "units": st.column_config.NumberColumn(tr("units"), min_value=1, step=1, default=1),
                 "size": st.column_config.TextColumn(tr("size_col"), help=tr("size_help")),
+                "price": st.column_config.NumberColumn(tr("price_col"), disabled=True, format="₪%.2f", width="small"),
             },
             hide_index=True, width="stretch", key="staged_editor",
+            height=min(40 + 35 * len(staged), 640),
         )
         c1, c2 = st.columns(2)
         if c1.button(tr("commit"), type="primary"):
@@ -787,23 +807,100 @@ def render_review():
                 st.error(tr("size_bad") + " " + ", ".join(bad_size))
             else:
                 records = []
+                originals = st.session_state["staged_items"]
                 for r in keep.itertuples():
                     pid = None if pd.isna(r.pid) else int(r.pid)
                     en, he = (r.name_en, r.name_he) if pid else fill_names(r.name_en, r.name_he)
+                    code_key = originals[r.Index].get("code_key") if r.Index < len(originals) else None
                     records.append({"product_id": pid, "name_en": en, "name_he": he, "category": r.category,
                                     "units": int(r.units or 1), "size": parse_size_text(r.size),
-                                    "raw_name": r.raw_name or None})
+                                    "raw_name": r.raw_name or None, "aliases": [code_key] if code_key else []})
                 svc.record_purchases(household_id, records, st.session_state["staged_date"], display_name)
-                st.session_state.pop("staged_items", None)
+                clear_staged()
                 st.toast(tr("saved_n", n=len(records)))
                 st.rerun()
         if c2.button(tr("discard")):
-            st.session_state.pop("staged_items", None)
+            clear_staged()
             st.rerun()
 
 
+def clear_staged():
+    for k in ("staged_items", "staged_source", "receipt_summary"):
+        st.session_state.pop(k, None)
+
+
+def render_receipt_summary():
+    """How the reading compares with the receipt's own total and item count."""
+    rs = st.session_state.get("receipt_summary") or {}
+    if not rs:
+        return
+    where = f" · {rs['store']}" if rs.get("store") else ""
+    if rs.get("total") is None:
+        st.info(tr("receipt_no_total", n=rs["lines"]) + where)
+    elif not rs["sum_off"] and not rs["count_off"]:
+        st.success(tr("receipt_ok", n=rs["lines"], total=f"{rs['total']:.2f}") + where)
+    else:
+        if rs["sum_off"]:
+            st.warning(tr("receipt_sum_off", got=f"{rs['rows_sum']:.2f}", total=f"{rs['total']:.2f}",
+                          diff=f"{abs(rs['missing']):.2f}"))
+        if rs["count_off"]:
+            st.warning(tr("receipt_count_off", got=f"{rs['counted']:g}", count=f"{rs['item_count']:g}"))
+    notes = []
+    if rs.get("merged"):
+        notes.append(tr("receipt_merged", n=rs["merged"]))
+    if rs.get("deposits"):
+        notes.append(tr("receipt_deposits", amt=f"{rs['deposits']:.2f}"))
+    if notes:
+        st.caption(" · ".join(notes))
+
+
 def render_receipt_tab():
-    st.info(tr("receipt_soon"))
+    reader = ReceiptReader()
+    st.caption(tr("receipt_help"))
+    up = st.file_uploader(tr("receipt_upload"), type=["jpg", "jpeg", "png", "webp", "heic", "heif", "pdf"],
+                          key="receipt_file")
+    if st.button(tr("receipt_read_btn"), type="primary", disabled=not reader.available or up is None,
+                 help=None if reader.available else "Set OPENAI_API_KEY to enable"):
+        loader = st.empty()
+        loader.markdown(cart_spinner_html(tr("receipt_working")), unsafe_allow_html=True)
+        try:
+            res = reader.read(up.getvalue(), up.name)
+            if not res.lines:
+                raise ReceiptError("nothing")
+            names = get_parser().describe_lines([ln.text for ln in res.lines], categories)
+        except ReceiptError as e:
+            loader.empty()
+            st.error(tr(f"receipt_err_{e}") if f"receipt_err_{e}" in I18N_KEYS else tr("receipt_err_api"))
+            return
+        items = []
+        for ln, nm in zip(res.lines, names):
+            items.append({"raw_name": ln.text, "name_en": nm["name_en"], "name_he": nm["name_he"],
+                          "category": nm["category"], "units": ln.units, "size": size_label(ln.size),
+                          "price": ln.price, "code_key": code_alias(ln.code, res.store)})
+        products_now = svc.get_products(household_id)
+        by_id = {p["id"]: p for p in products_now}
+        suggestions = ProductMatcher(products_now, svc.get_aliases(household_id), get_parser()).suggest(items)
+        for it, sug in zip(items, suggestions):
+            it["product_id"] = sug.product_id
+            it["match"] = sug.reason
+            if sug.product_id:
+                it["category"] = by_id[sug.product_id]["category"] or it.get("category")
+        try:
+            r_date = date.fromisoformat(res.date) if res.date else today
+        except ValueError:
+            r_date = today
+        loader.empty()
+        st.session_state["staged_items"] = items
+        st.session_state["staged_date"] = r_date if r_date <= today else today
+        st.session_state["staged_source"] = "receipt"
+        st.session_state["receipt_summary"] = {
+            "lines": len(res.lines), "store": res.store, "total": res.total, "rows_sum": res.rows_sum,
+            "missing": res.missing_amount, "item_count": res.item_count, "counted": res.counted,
+            "sum_off": res.sum_mismatch, "count_off": res.count_mismatch, "merged": res.merged,
+            "deposits": res.deposits}
+        log.info("Receipt read: %d lines, %d images, %d calls, sum_off=%s count_off=%s",
+                 len(res.lines), res.images, res.calls, res.sum_mismatch, res.count_mismatch)
+        st.rerun()
 
 
 def render_add_groceries():

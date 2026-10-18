@@ -147,6 +147,45 @@ Return JSON: {{"items": [{{"line": "original text", "item_name_en": "English nam
             })
         return items
 
+    def describe_lines(self, lines: list[str], categories: list[dict]) -> list[dict]:
+        """Name and categorize receipt lines, strictly one answer per line (by index).
+
+        Unlike `parse`, the model can't merge, split or drop lines here: anything it skips falls
+        back to the printed text with no category, so the user still sees every line.
+        Returns [{"name_en", "name_he", "category"}] aligned with `lines`.
+        """
+        out = [{"name_en": "", "name_he": t, "category": None} for t in lines]
+        if not lines or not self.available:
+            return out
+        valid = [c["en"] for c in categories]
+        cats_formatted = "\n".join(f'- "{c["en"]}" (Hebrew: {c["he"]})' for c in categories)
+        prompt = (
+            "These lines come from an Israeli supermarket receipt. Receipt printers cut descriptions at "
+            "~20 characters, so words may be truncated (e.g. 'גבינה גאודה מגוררת ח' = grated gouda cheese).\n"
+            "For each line give a short generic product name in English and in Hebrew, WITHOUT brand or "
+            "package size, keeping meaningful variants (fat %, flavor, type): "
+            "'חלב 3% רמת הגולן 1 ל' → '3% Milk' / 'חלב 3%'. 'חזה עוף טרי פרימה' → 'Chicken breast' / 'חזה עוף'.\n"
+            f"Use ONLY these category keys (copy the English key exactly):\n{cats_formatted}\n"
+            'Return JSON {"items": [{"i": <same i>, "en": "...", "he": "...", "category": "..."}]} '
+            "with exactly one entry per line.\n"
+            + json.dumps([{"i": i, "line": t} for i, t in enumerate(lines)], ensure_ascii=False))
+        try:
+            resp = self._get_client().chat.completions.create(
+                model=MODEL, response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": prompt}], temperature=0.0)
+            data = json.loads(resp.choices[0].message.content)
+        except Exception:
+            log.exception("Naming receipt lines failed; showing them as printed")
+            return out
+        for it in data.get("items", []):
+            i = it.get("i")
+            if not isinstance(i, int) or not 0 <= i < len(lines):
+                continue
+            en, he = normalize_name_pair(str(it.get("en") or ""), str(it.get("he") or ""))
+            cat = it.get("category")
+            out[i] = {"name_en": en, "name_he": he or lines[i], "category": cat if cat in valid else None}
+        return out
+
     def choose_products(self, requests: list[dict]) -> dict[int, int | None]:
         """For each unclear line, pick one of its candidate products or None (= a new product).
 

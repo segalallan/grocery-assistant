@@ -74,6 +74,8 @@ _CSS = f"""
   box-shadow: 0 6px 8px -8px rgba(0,0,0,.25);
 }}
 .st-key-pantry_actions, .st-key-shop_actions {{ padding: .5rem 0; }}
+/* Invisible slot for the remember-me cookie script (always present, takes no space). */
+[data-testid="stLayoutWrapper"]:has(> .st-key-cookie_slot), .st-key-cookie_slot {{ display: none; }}
 /* Anything scrolled into view (e.g. by keyboard) lands below the pinned bar, not under it. */
 [data-testid="stForm"] [data-testid="stCheckbox"] {{ scroll-margin-top: 8rem; }}
 

@@ -1,7 +1,7 @@
 """Suggest which existing product each incoming line belongs to.
 
 Pipeline (cheapest first):
-  1. Known alias   – this exact cleaned text was confirmed before          → match
+  1. Known alias   – this item code (receipts) or exact cleaned text was confirmed before → match
   2. Fuzzy         – string similarity against product names and aliases  → match if clearly best
   3. AI            – one batched gpt-4o-mini call for the unclear lines   → match or "new"
 The user always confirms in the review table; confirmed lines become aliases (see PantryService).
@@ -15,6 +15,7 @@ AUTO_MATCH = 0.90      # fuzzy score that is trusted without asking the AI
 AUTO_MARGIN = 0.10     # ...as long as the runner-up is clearly worse
 AI_FLOOR = 0.40        # below this, a candidate isn't worth showing to the AI
 NO_AI_MATCH = 0.80     # without an API key, match only on strong similarity
+CODE_PREFIX = "code "  # aliases made from receipt item codes (see receipt_reader.code_alias)
 
 
 @dataclass
@@ -51,7 +52,9 @@ class ProductMatcher:
                 if k:
                     self.keys[p["id"]].add(k)
         for alias, pid in aliases.items():
-            if pid in self.keys:
+            # Item-code aliases only ever match exactly: "code 9000122" vs "code 9000123" are
+            # nearly identical strings but completely different products.
+            if pid in self.keys and not alias.startswith(CODE_PREFIX):
                 self.keys[pid].add(alias)
 
     def _texts(self, item) -> list[str]:
@@ -71,9 +74,10 @@ class ProductMatcher:
         out: list[Suggestion | None] = []
         unsure: list[tuple[int, dict, list[tuple[int, float]]]] = []
         for i, item in enumerate(items):
-            # 1. known alias
-            hit = next((self.aliases[k] for k in (match_key(t) for t in self._texts(item))
-                        if k in self.aliases and self.aliases[k] in self.products), None)
+            # 1. known alias: the item's code first (most reliable), then its texts
+            keys = [match_key(item.get("code_key"))] if item.get("code_key") else []
+            keys += [match_key(t) for t in self._texts(item)]
+            hit = next((self.aliases[k] for k in keys if k in self.aliases and self.aliases[k] in self.products), None)
             ranked = self._ranked(item)
             cands = [pid for pid, _ in ranked[:5]]
             if hit:
