@@ -59,6 +59,19 @@ becomes conditional: P(gone by today | was there on the confirmed date).
 Accuracy on real receipts: put receipts and hand transcriptions (`<name>.truth.json`) in
 `data/receipts/` (gitignored) and run `python notebooks/eval_receipts.py` with `OPENAI_API_KEY` set.
 
+## Admin test mode
+
+Admins (`ADMIN_EMAILS`) get a **🧪 Test mode** switch under their name. While it's on, everything
+(purchases, receipt scans, edits, deletions) goes to a private sandbox household (`households.is_test = 1`,
+linked via `users.sandbox_household_id`) instead of the real pantry. The sandbox:
+
+* is never emailed (alerts follow `users.household_id`, the real household), can't be joined by code,
+  and is left out of admin statistics and scanner reliability;
+* starts empty and can be wiped with **🧹 Reset sandbox**; it's deleted along with the account.
+
+Rule for future code: anything computed across households (pooled priors, population stats) must use
+`db.real_household_ids()` or filter `COALESCE(is_test, 0) = 0`.
+
 ## Database
 
 * Local: a SQLite file (`pantry_v1.db` in the project folder), no setup.

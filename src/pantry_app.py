@@ -110,7 +110,7 @@ def send_feedback(message: str):
     import html as _html
     from notifications import send_admin_email
     ctx = f"lang={st.session_state.get('lang')} items={len(pantry_all) if 'pantry_all' in globals() else '?'}"
-    db.add_feedback(st.session_state.get("user_id"), st.session_state.get("household_id"),
+    db.add_feedback(st.session_state.get("user_id"), st.session_state.get("household_id"),  # the real one
                     st.session_state.get("email"), message, ctx)
     send_admin_email(f"Smart Pantry feedback from {st.session_state.get('display_name')}",
                      f"<p><b>From:</b> {_html.escape(str(st.session_state.get('email')))} · "
@@ -415,15 +415,31 @@ if not st.session_state.get("authenticated"):
 # ==========================================================================
 # Session context
 # ==========================================================================
-household_id = st.session_state["household_id"]
+from notifications import admin_emails  # noqa: E402
+IS_ADMIN = (st.session_state.get("email") or "").lower() in admin_emails()
+# Admin test mode: everything happens in a private sandbox household, so nothing touches the real
+# pantry or any shared statistic (the sandbox is flagged is_test and excluded everywhere).
+TEST_MODE = IS_ADMIN and bool(st.session_state.get("test_mode"))
+real_household_id = st.session_state["household_id"]
+household_id = db.sandbox_for(st.session_state["user_id"]) if TEST_MODE else real_household_id
 display_name = st.session_state["display_name"]
-household_name = st.session_state["household_name"]
+household_name = db.SANDBOX_NAME if TEST_MODE else st.session_state["household_name"]
 today = app_today()
 
 head_l, head_r = st.columns([3, 1.6], vertical_alignment="center")
 with head_l:
     st.title(tr("title"))
-    st.markdown(f"👤 **{display_name}** · 🏠 **{household_name}** · {tr('invite')} `{st.session_state['household_code']}`")
+    if TEST_MODE:
+        st.markdown(f"👤 **{display_name}** · **{household_name}**")
+    else:
+        st.markdown(f"👤 **{display_name}** · 🏠 **{household_name}** · {tr('invite')} `{st.session_state['household_code']}`")
+    if IS_ADMIN:
+        want = st.toggle(tr("test_mode"), value=TEST_MODE, key="test_mode_toggle", help=tr("test_mode_help"))
+        if want != TEST_MODE:
+            st.session_state["test_mode"] = want
+            for k in ("staged_items", "staged_source", "receipt_summary", "receipt_scan_id", "staged_original"):
+                st.session_state.pop(k, None)           # a half-finished review belongs to the other household
+            st.rerun()
 with head_r, st.container(horizontal=True, wrap=True, gap="small", horizontal_alignment="right"):
     with st.popover(tr("account"), width="content"):
         prefs = db.get_email_prefs(st.session_state["user_id"])
@@ -848,6 +864,8 @@ REVIEW_FIELDS = ("product_id", "units", "size", "name_en", "name_he", "category"
 def log_scan(**fields):
     """Scanner reliability stats for the admin view. Never blocks or breaks a scan."""
     try:
+        # A flag only (no identity): scans from a test household are left out of the stats.
+        fields.setdefault("is_test", db.is_test_household(household_id))
         return db.log_receipt_scan(**fields)
     except Exception:
         log.exception("Couldn't log the receipt scan")
@@ -973,6 +991,17 @@ def render_intro():
             st.rerun()
 
 
+if TEST_MODE:
+    with st.container(border=True, key="test_mode_banner"):
+        b1, b2 = st.columns([4, 1], vertical_alignment="center")
+        b1.markdown(tr("test_banner"))
+        if b2.button(tr("test_reset"), key="reset_sandbox", width="stretch"):
+            db.reset_sandbox(st.session_state["user_id"])
+            for k in ("staged_items", "staged_source", "receipt_summary", "receipt_scan_id", "staged_original"):
+                st.session_state.pop(k, None)
+            st.toast(tr("test_reset_done"))
+            st.rerun()
+
 if not st.session_state.get("intro_dismissed"):
     render_intro()
 
@@ -982,8 +1011,6 @@ if candidates:
     if st.button(tr("restock_banner", n=len(candidates)), type="primary", width="stretch"):
         restock_dialog(candidates)
 
-from notifications import admin_emails  # noqa: E402
-IS_ADMIN = (st.session_state.get("email") or "").lower() in admin_emails()
 _tabs = st.tabs([tr("tab_pantry"), tr("tab_shopping"), tr("tab_categories"), tr("tab_curves")]
                 + ([tr("tab_admin")] if IS_ADMIN else []))
 tab_pantry, tab_shopping, tab_categories, tab_curves = _tabs[:4]
@@ -1266,7 +1293,10 @@ def _pct(part, whole):
 def render_scanner_stats():
     """Receipt scanner reliability. Built only from receipt_scans: no contents, amounts or identities."""
     st.markdown(f"**{tr('adm_scanner')}**")
-    scans = db.receipt_scans((today - timedelta(days=30)).isoformat())
+    every = db.receipt_scans((today - timedelta(days=30)).isoformat())
+    scans = [x for x in every if not x.get("is_test")]
+    if len(every) > len(scans):
+        st.caption(tr("adm_test_scans_hidden", n=len(every) - len(scans)))
     if not scans:
         st.caption(tr("adm_scanner_none"))
         return
@@ -1320,7 +1350,7 @@ def render_scanner_stats():
 
 if tab_admin is not None:
     with tab_admin:
-        stats = db.admin_stats(today.isoformat())
+        stats = db.admin_stats(today.isoformat())                   # sandboxes are never included
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(tr("adm_households"), len(stats))
         m2.metric(tr("adm_users"), sum(r["members"] for r in stats))
@@ -1328,7 +1358,8 @@ if tab_admin is not None:
         m4.metric(tr("adm_active_7d"), sum(1 for r in stats if r["buys_7d"]))
         st.markdown(f"**{tr('adm_by_household')}**")
         st.dataframe(pd.DataFrame([{
-            tr("adm_household"): r["name"], tr("adm_code"): r["household_code"], tr("adm_members"): r["members"],
+            tr("adm_household"): r["name"], tr("adm_code"): r["household_code"],
+            tr("adm_members"): r["members"],
             tr("adm_products"): r["products"], tr("adm_in_pantry"): r["in_pantry"], tr("adm_buys_7d"): r["buys_7d"],
             tr("adm_buys_30d"): r["buys_30d"], tr("adm_cycles"): r["cycles"], tr("adm_last"): r["last_purchase"] or "—",
         } for r in stats]), hide_index=True, width="stretch")

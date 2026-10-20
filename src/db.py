@@ -214,8 +214,11 @@ _SCHEMA = [
 # Columns added after v1; applied to older databases.
 MIGRATION_COLUMNS = {
     # eff_units = amount in "reference packages" (2 x 2 L with a 1 L reference = 4.0). NULL on old rows → use units.
+    # Sandbox households (admin test mode) are left out of every shared statistic and can't be joined.
+    "households": {"is_test": "INTEGER DEFAULT 0"},
     "users": {"email_alerts": "INTEGER DEFAULT 1", "email_lang": "TEXT DEFAULT 'en'",
-              "intro_dismissed": "INTEGER DEFAULT 0"},
+              "intro_dismissed": "INTEGER DEFAULT 0", "sandbox_household_id": "INTEGER"},
+    "receipt_scans": {"is_test": "INTEGER DEFAULT 0"},
     "inventory": {"item_key": "TEXT", "confirmed_until": "TEXT", "last_alerted": "TEXT"},
     "purchase_history": {"item_key": "TEXT", "units": "INTEGER", "kind": "TEXT"},
     "purchases": {"item_key": "TEXT"},
@@ -509,9 +512,12 @@ class Database:
         """Delete an account, its logins and reset codes. The household's data is deleted too
         if this was its last member; otherwise it stays for the remaining members."""
         with self.connect() as conn:
-            row = conn.execute("SELECT household_id FROM users WHERE id = ?", (user_id,)).fetchone()
+            row = conn.execute("SELECT household_id, sandbox_household_id FROM users WHERE id = ?",
+                               (user_id,)).fetchone()
             if not row:
                 return
+            if row["sandbox_household_id"]:
+                self._delete_household_data(conn, row["sandbox_household_id"])
             for t in ("login_sessions", "password_resets"):
                 conn.execute(f"DELETE FROM {t} WHERE user_id = ?", (user_id,))
             conn.execute("UPDATE feedback SET user_id = NULL, email = NULL WHERE user_id = ?", (user_id,))
@@ -528,13 +534,49 @@ class Database:
                                 (household_id,)).fetchall()
         return [{k: r[k] for k in r.keys()} for r in rows]
 
+    # ---------- admin test mode: a private sandbox household ----------
+    SANDBOX_NAME = "🧪 Sandbox"
+
+    def sandbox_for(self, user_id) -> int:
+        """The user's sandbox household, created on first use. It has no members, so it never gets
+        emails, can't be joined, and is excluded from every shared statistic (is_test = 1)."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT sandbox_household_id FROM users WHERE id = ?", (user_id,)).fetchone()
+            hh = row[0] if row else None
+            if hh and conn.execute("SELECT 1 FROM households WHERE id = ?", (hh,)).fetchone():
+                return hh
+            hh = self._create_household(conn, self.SANDBOX_NAME)
+            conn.execute("UPDATE households SET is_test = 1 WHERE id = ?", (hh,))
+            conn.execute("UPDATE users SET sandbox_household_id = ? WHERE id = ?", (hh, user_id))
+            return hh
+
+    def reset_sandbox(self, user_id):
+        """Wipe the sandbox; the next sandbox_for() starts a fresh, empty one."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT sandbox_household_id FROM users WHERE id = ?", (user_id,)).fetchone()
+            if row and row[0]:
+                self._delete_household_data(conn, row[0])
+                conn.execute("UPDATE users SET sandbox_household_id = NULL WHERE id = ?", (user_id,))
+
+    def is_test_household(self, household_id) -> bool:
+        with self.connect() as conn:
+            row = conn.execute("SELECT is_test FROM households WHERE id = ?", (household_id,)).fetchone()
+        return bool(row and row[0])
+
+    def real_household_ids(self) -> list[int]:
+        """Households whose data may feed shared statistics. ANY population-level number
+        (admin totals, and later priors learned from everyone's data) must use this."""
+        with self.connect() as conn:
+            rows = conn.execute("SELECT id FROM households WHERE COALESCE(is_test, 0) = 0 ORDER BY id").fetchall()
+        return [r[0] for r in rows]
+
     def admin_stats(self, today_iso: str) -> list[dict]:
         """Per-household activity for the beta admin view."""
         d7 = (datetime.fromisoformat(today_iso) - timedelta(days=7)).date().isoformat()
         d30 = (datetime.fromisoformat(today_iso) - timedelta(days=30)).date().isoformat()
         with self.connect() as conn:
             rows = conn.execute(
-                """SELECT h.id, h.name, h.household_code,
+                """SELECT h.id, h.name, h.household_code, COALESCE(h.is_test, 0) AS is_test,
                           (SELECT COUNT(*) FROM users u WHERE u.household_id = h.id) AS members,
                           (SELECT COUNT(*) FROM products p WHERE p.household_id = h.id) AS products,
                           (SELECT COUNT(*) FROM inventory i WHERE i.household_id = h.id) AS in_pantry,
@@ -542,7 +584,7 @@ class Database:
                           (SELECT COUNT(*) FROM purchases pu WHERE pu.household_id = h.id AND pu.purchase_date >= ?) AS buys_30d,
                           (SELECT COUNT(*) FROM purchase_history ph WHERE ph.household_id = h.id) AS cycles,
                           (SELECT MAX(pu.purchase_date) FROM purchases pu WHERE pu.household_id = h.id) AS last_purchase
-                   FROM households h ORDER BY h.id""", (d7, d30)).fetchall()
+                   FROM households h WHERE COALESCE(h.is_test, 0) = 0 ORDER BY h.id""", (d7, d30)).fetchall()
         return [{k: r[k] for k in r.keys()} for r in rows]
 
     def create_user(self, email, password, first_name, last_name, household_name=None, join_code=None):
@@ -553,7 +595,7 @@ class Database:
                 return False, "An account with this email already exists."
 
             if join_code:
-                row = conn.execute("SELECT id FROM households WHERE household_code = ?",
+                row = conn.execute("SELECT id FROM households WHERE household_code = ? AND COALESCE(is_test, 0) = 0",
                                    (join_code.strip().upper(),)).fetchone()
                 if not row:
                     return False, "Invalid join code."
@@ -692,7 +734,7 @@ class Database:
 
     # ---------- receipt scanner reliability (no receipt contents, no user identity) ----------
     SCAN_FIELDS = ("source", "chain", "model", "images", "calls", "seconds", "lines", "merged", "repaired",
-                   "rechecked", "has_total", "sum_ok", "gap_pct", "has_count", "count_ok", "outcome")
+                   "rechecked", "has_total", "sum_ok", "gap_pct", "has_count", "count_ok", "outcome", "is_test")
 
     def log_receipt_scan(self, **fields) -> int:
         cols = [c for c in self.SCAN_FIELDS if c in fields]

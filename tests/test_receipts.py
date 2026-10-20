@@ -546,7 +546,7 @@ def test_scan_stats_store_no_personal_data(backend):
     assert len(rows) == 1 and rows[0]["outcome"] == "saved" and rows[0]["rematched"] == 2
     assert set(rows[0]) == {"id", "scanned_on", "source", "chain", "model", "images", "calls", "seconds", "lines",
                             "merged", "repaired", "rechecked", "has_total", "sum_ok", "gap_pct", "has_count",
-                            "count_ok", "outcome", "kept", "unticked", "rematched", "edited"}
+                            "count_ok", "outcome", "kept", "unticked", "rematched", "edited", "is_test"}
     # nothing that identifies a person or what they bought: no user/household, items, prices or amounts
 
 
@@ -599,3 +599,70 @@ def test_admin_sees_scanner_reliability(app_env, monkeypatch):
     metrics = {m.label: m.value for m in at.metric}
     assert metrics["Scans"] == "4" and metrics["Adds up exactly"] == "67%" and metrics["Lines users fixed"] == "5%"
     assert any("no receipt contents" in c.value for c in at.caption)
+
+
+# ---------------------------------------------------------------- admin test mode (sandbox)
+def test_sandbox_is_private_and_excluded_everywhere(backend):
+    from config import today
+    from engine import PantryDepletionEngine
+    from pantry_service import PantryService
+    db = backend()
+    db.create_user("admin@b.com", "password1", "A", "S", household_name="Admin home")
+    admin = db.authenticate("admin@b.com", "password1")
+    box = db.sandbox_for(admin["id"])
+    assert box != admin["household_id"] and db.sandbox_for(admin["id"]) == box       # one per user
+    assert db.is_test_household(box) and db.real_household_ids() == [admin["household_id"]]
+    with db.connect() as conn:
+        box_code = conn.execute("SELECT household_code FROM households WHERE id = ?", (box,)).fetchone()[0]
+    ok, err = db.create_user("intruder@b.com", "password1", "I", "S", join_code=box_code)
+    assert not ok                                                                   # can't be joined
+    svc = PantryService(db, PantryDepletionEngine())
+    svc.record_purchase(box, "Milk", "חלב", "Dairy & Eggs", 1, today() - timedelta(days=2), "A")
+    assert [r["id"] for r in db.admin_stats(today().isoformat())] == [admin["household_id"]]
+    db.reset_sandbox(admin["id"])
+    assert db.sandbox_for(admin["id"]) != box and not svc.get_pantry(db.sandbox_for(admin["id"]))
+    db.delete_user(admin["id"])
+    assert db.real_household_ids() == [] and not db.is_test_household(box)
+
+
+def test_admin_test_mode_keeps_everything_in_the_sandbox(app_env, monkeypatch):
+    from config import today
+    from engine import PantryDepletionEngine
+    from pantry_service import PantryService
+    monkeypatch.setenv("ADMIN_EMAILS", "a@b.com")
+    svc = PantryService(app_env, PantryDepletionEngine())
+    admin = app_env.authenticate("a@b.com", "password1")
+    real = admin["household_id"]
+    svc.record_purchase(real, "Rice", "אורז", "Pantry Staples", 1, today() - timedelta(days=3), "Avi")
+    app_env.log_receipt_scan(source="pdf", lines=10, has_total=True, sum_ok=True)
+
+    at = _logged_in(app_env).run()
+    next(t for t in at.toggle if t.label == "🧪 Test mode").set_value(True).run()
+    assert not at.exception, at.exception
+    assert any("Test mode" in m.value for m in at.markdown)                       # the banner
+    box = app_env.sandbox_for(admin["id"])
+    # a receipt saved in test mode lands in the sandbox
+    at.session_state["staged_items"] = [{"raw_name": "בננה", "name_en": "Banana", "name_he": "בננה",
+                                         "category": "Produce", "units": 1, "size": "1 kg", "price": 8.0,
+                                         "product_id": None, "match": "new", "code_key": "code test 9005417"}]
+    at.session_state["staged_date"] = today()
+    at.session_state["staged_source"] = "receipt"
+    at.session_state["receipt_scan_id"] = app_env.log_receipt_scan(source="photo", lines=1, is_test=True)
+    at.run()
+    next(b for b in at.button if b.label == "✅ Save to pantry").click().run()
+    assert not at.exception, at.exception
+    assert [i["name_en"] for i in svc.get_pantry(box)] == ["Banana"]
+    assert [i["name_en"] for i in svc.get_pantry(real)] == ["Rice"]               # real pantry untouched
+    assert "code test 9005417" not in svc.get_aliases(real)
+    m = {x.label: x.value for x in at.metric}
+    assert m["Households"] == "1" and m["Purchases (7 days)"] == "1" and m["Scans"] == "1"
+    # switch back: the real household, exactly as before
+    next(t for t in at.toggle if t.label == "🧪 Test mode").set_value(False).run()
+    assert not any("Test mode." in m.value for m in at.markdown)
+    assert any(c.label and "Rice" in str(c.label) for c in at.checkbox) or "Rice" in str(at.markdown)
+
+
+def test_test_mode_is_admin_only(app_env, monkeypatch):
+    monkeypatch.setenv("ADMIN_EMAILS", "someone@else.com")
+    at = _logged_in(app_env).run()
+    assert not [t for t in at.toggle if t.label == "🧪 Test mode"]

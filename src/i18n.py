@@ -141,6 +141,18 @@ T = {
     "adm_message": ("Message", "הודעה"),
     "adm_context": ("Context", "הקשר"),
     "adm_none": ("No feedback yet.", "אין משוב עדיין."),
+    "test_mode": ("🧪 Test mode", "🧪 מצב בדיקה"),
+    "test_mode_help": ("Admins only. While it's on you work in a private sandbox household: purchases, scans and "
+                       "everything else stay there. Your real pantry and all shared statistics are untouched.",
+                       "למנהלים בלבד. כשהמצב פעיל עובדים במשק בית נפרד לבדיקות: קניות, סריקות וכל השאר נשארים שם. "
+                       "המזווה האמיתי וכל הנתונים המשותפים לא מושפעים."),
+    "test_banner": ("🧪 **Test mode.** You're in a private sandbox. Nothing you do here touches your real pantry, "
+                    "emails, admin statistics or what the app learns about typical households.",
+                    "🧪 **מצב בדיקה.** אתם בארגז חול פרטי. שום דבר כאן לא משפיע על המזווה האמיתי, על המיילים, "
+                    "על נתוני הניהול או על מה שהאפליקציה לומדת על משק בית טיפוסי."),
+    "test_reset": ("🧹 Reset sandbox", "🧹 איפוס ארגז החול"),
+    "test_reset_done": ("Sandbox emptied", "ארגז החול רוקן"),
+    "adm_test_scans_hidden": ("{n} scans made in test mode are left out.", "{n} סריקות שנעשו במצב בדיקה לא נכללות."),
     "adm_scanner": ("📷 Receipt scanner (last 30 days)", "📷 סורק הקבלות (30 הימים האחרונים)"),
     "adm_scanner_none": ("No receipts scanned yet.", "עדיין לא נסרקו קבלות."),
     "adm_scans": ("Scans", "סריקות"),
